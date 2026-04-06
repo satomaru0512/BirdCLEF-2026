@@ -1,0 +1,1 @@
+※GEMINI DEEP RESEARCHの結果をベタ貼り

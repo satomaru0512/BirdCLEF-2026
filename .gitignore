@@ -1,0 +1,104 @@
+# Credentials and API Keys
+.env
+.env.*
+kaggle.json
+*.key
+*.pem
+
+# Weights & Biases
+wandb/
+*.wandb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Model outputs
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+*.pickle
+
+# Data
+input/
+data/
+datasets/
+!.env.template
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+.code-workspace
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Output directories
+outputs_*/
+results/
+runs/
+
+# Specific to this project
+
+EXP/**/models/*.pth
+EXP/**/models/*.pkl
+EXP/**/models/oof_*.csv
+EXP/**/models/oof_*.json
+
+
+notebooks/EDA
+
+
+*.npy
+
+# Claude Code
+.claude/
+
+# Note:
+# We intentionally do NOT ignore *.csv / *.json / *.jpg / *.png / *.ipynb globally.
+# This public repository includes selected OOF files, analysis outputs, figures, and notebooks.
+# If you want to ignore those locally, use `.git/info/exclude` or your global gitignore.
