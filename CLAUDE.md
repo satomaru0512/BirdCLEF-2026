@@ -1,4 +1,4 @@
-# CLAUDE.md
+# CLAUDE.md　ういー
 
 このファイルは、リポジトリ内のコードを扱う際の Claude Code (claude.ai/code) へのガイダンスを提供します。
 
