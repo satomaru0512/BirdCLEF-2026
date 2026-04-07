@@ -223,6 +223,7 @@ class PerchClassifier(tf.keras.Model):
             tf.keras.layers.Dropout(0.5),
             tf.keras.layers.Dense(n_classes, activation="sigmoid", dtype="float32"),
         ], name="head")
+        self.head.build(input_shape=(None, 1280))  # Lazy Buildingを防ぐ
 
     def _infer_perch_batch(self, waveform):
         """バッチ内の各サンプルを1つずつ処理してembeddingを返す"""
