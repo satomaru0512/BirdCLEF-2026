@@ -15,6 +15,24 @@
 - 学習済みモデルは `kagglehub` 経由で Kaggle Models にアップロード
 - **学習は GPU 使用可能**（Kaggle GPU ノートブックを利用）
 
+**重要: ファインチューニング済みモデルの Kaggle Models へのアップロード**
+- ファインチューニングが完了したモデルは必ず **Kaggle Models にアップロード**すること
+- `train.py` には必ずアップロード処理を含めること（省略禁止）
+- 実装例:
+
+```python
+import kagglehub
+
+# モデルの保存
+torch.save(model.state_dict(), "model.pth")
+
+# Kaggle Models へのアップロード
+kagglehub.model_upload(
+    handle="wasabi777/birdclef-2026/<framework>/<variation>",
+    local_model_dir="./",  # モデルファイルのあるディレクトリ
+)
+```
+
 **推論環境**: Kaggle Notebooks
 - 推論スクリプトは Kaggle の提出環境で動作するよう設計
 - Kaggle の制約（実行時間 ≤9時間、インターネット不可）を遵守すること

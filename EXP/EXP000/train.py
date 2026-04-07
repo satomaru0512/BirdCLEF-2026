@@ -99,6 +99,11 @@ class CFG:
     # wandb
     WANDB_PROJECT = "birdclef-2026"
 
+    # Kaggle Models アップロード先
+    # 形式: "{kaggle_username}/{model-name}/tensorFlow2/{variant}"
+    # 例: "satomaru0512/birdclef2026-exp000/tensorFlow2/perch-v2-baseline"
+    KAGGLE_MODEL_HANDLE = "wasabi777/birdclef2026-exp000/tensorFlow2/perch-v2-baseline"
+
 
 # ============================================================
 # Utilities
@@ -480,6 +485,25 @@ def train_fold(
 
 
 # ============================================================
+# Kaggle Models アップロード
+# ============================================================
+def upload_to_kaggle_models(output_dir: Path, mean_auc: float) -> None:
+    """学習済みモデル一式をKaggle Modelsにアップロード"""
+    print(f"\nUploading to Kaggle Models: {CFG.KAGGLE_MODEL_HANDLE}")
+    version_notes = (
+        f"{CFG.EXP_NAME}/{CFG.CHILD_EXP} | "
+        f"OOF ROC-AUC: {mean_auc:.4f} | "
+        f"Perch 2.0 fine-tune | {CFG.N_FOLDS} folds"
+    )
+    kagglehub.model_upload(
+        handle=CFG.KAGGLE_MODEL_HANDLE,
+        local_model_dir=str(output_dir),
+        version_notes=version_notes,
+    )
+    print("Upload complete!")
+
+
+# ============================================================
 # Main
 # ============================================================
 def main():
@@ -528,6 +552,9 @@ def main():
     results = {"oof_aucs": oof_aucs, "mean_auc": mean_auc, "std_auc": std_auc}
     with open(CFG.OUTPUT_DIR / "results.json", "w") as f:
         json.dump(results, f, indent=2)
+
+    # Kaggle Models にアップロード
+    upload_to_kaggle_models(CFG.OUTPUT_DIR, mean_auc)
 
 
 if __name__ == "__main__":
