@@ -158,10 +158,13 @@ def run_inference(perch_path: str, weights_dir: Path, tax: pd.DataFrame) -> pd.D
     """5-fold アンサンブル推論 → submission DataFrame"""
     test_files = sorted(glob.glob(str(CFG.TEST_SOUNDSCAPE_DIR / "*.ogg")))
     print(f"Test files: {len(test_files)}")
-    if len(test_files) == 0:
-        raise FileNotFoundError(f"No ogg files in {CFG.TEST_SOUNDSCAPE_DIR}")
 
     label_cols = list(tax["primary_label"])
+
+    if len(test_files) == 0:
+        # 提出前の編集環境ではテストファイルが存在しない（提出時に差し替えられる）
+        print("No test files found. Creating empty submission for commit.")
+        return pd.DataFrame(columns=["row_id"] + label_cols)
 
     # fold毎に累積して最後に平均
     fold_preds = {fp: np.zeros((12, CFG.N_CLASSES), dtype=np.float64) for fp in test_files}
