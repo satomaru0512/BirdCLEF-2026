@@ -8,6 +8,7 @@ EXP000: BirdCLEF+ 2026 推論スクリプト
 """
 
 import glob
+import librosa
 from pathlib import Path
 
 import kagglehub
@@ -26,9 +27,10 @@ class CFG:
     CHILD_EXP = "child-exp000"
 
     # Audio
-    SAMPLE_RATE = 32000
-    DURATION    = 5
-    N_SAMPLES   = SAMPLE_RATE * DURATION  # 160_000
+    SAMPLE_RATE  = 32000
+    DURATION     = 5
+    N_SAMPLES    = SAMPLE_RATE * DURATION  # 160_000
+    N_SEGMENTS   = 12                      # 1分 / 5秒 = 12セグメント
 
     # Data paths (Kaggle環境)
     DATA_DIR            = Path("/kaggle/input/competitions/birdclef-2026")
@@ -85,11 +87,17 @@ class PerchClassifier(tf.keras.Model):
 # ============================================================
 # Utilities
 # ============================================================
-def load_taxonomy():
-    tax = pd.read_csv(CFG.DATA_DIR / "taxonomy.csv")
-    label2idx = {label: idx for idx, label in enumerate(tax["primary_label"])}
-    idx2label = {idx: label for label, idx in label2idx.items()}
-    return tax, label2idx, idx2label
+def load_label_cols() -> list:
+    """
+    [C2修正] sample_submission.csv の列順を正として label_cols を返す。
+    taxonomy.csv の行順に依存しない。
+    """
+    sample_sub = pd.read_csv(CFG.DATA_DIR / "sample_submission.csv", nrows=1)
+    label_cols = [c for c in sample_sub.columns if c != "row_id"]
+    assert len(label_cols) == CFG.N_CLASSES, (
+        f"sample_submission has {len(label_cols)} label cols, expected {CFG.N_CLASSES}"
+    )
+    return label_cols
 
 
 def load_audio_full(filepath: str) -> np.ndarray:
@@ -99,7 +107,6 @@ def load_audio_full(filepath: str) -> np.ndarray:
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         if sr != CFG.SAMPLE_RATE:
-            import librosa
             audio = librosa.resample(audio, orig_sr=sr, target_sr=CFG.SAMPLE_RATE)
         return audio.astype(np.float32)
     except (OSError, RuntimeError, ValueError) as e:
@@ -108,16 +115,15 @@ def load_audio_full(filepath: str) -> np.ndarray:
 
 
 def split_into_segments(audio: np.ndarray) -> list:
-    """1分音声を5秒セグメントに分割（最大12セグメント）"""
-    segments = []
-    n_seg = max(1, len(audio) // CFG.N_SAMPLES)
-    for i in range(n_seg):
-        start = i * CFG.N_SAMPLES
-        seg   = audio[start:start + CFG.N_SAMPLES]
-        if len(seg) < CFG.N_SAMPLES:
-            seg = np.pad(seg, (0, CFG.N_SAMPLES - len(seg)))
-        segments.append(seg)
-    return segments
+    """
+    [C3修正] 音声をまず 12×N_SAMPLES にpadしてから分割。
+    常に正確に12セグメントを返す。
+    """
+    target = CFG.N_SEGMENTS * CFG.N_SAMPLES
+    if len(audio) < target:
+        audio = np.pad(audio, (0, target - len(audio)))
+    audio = audio[:target]  # 長すぎる場合も12セグメント分に切る
+    return [audio[i * CFG.N_SAMPLES:(i + 1) * CFG.N_SAMPLES] for i in range(CFG.N_SEGMENTS)]
 
 
 def parse_filename_to_row_ids(filepath: str) -> list:
@@ -135,31 +141,22 @@ def predict_file(model: PerchClassifier, filepath: str) -> np.ndarray:
     Returns: shape (12, N_CLASSES)
     """
     audio    = load_audio_full(filepath)
-    segments = split_into_segments(audio)
+    segments = split_into_segments(audio)  # 常に12セグメント
 
     all_preds = []
     for i in range(0, len(segments), CFG.BATCH_SIZE):
-        batch    = np.stack(segments[i:i + CFG.BATCH_SIZE])       # (B, 160000)
+        batch    = np.stack(segments[i:i + CFG.BATCH_SIZE])
         batch_tf = tf.constant(batch, dtype=tf.float32)
-        preds    = model(batch_tf, training=False).numpy()         # (B, 234)
+        preds    = model(batch_tf, training=False).numpy()  # (B, 234)
         all_preds.append(preds)
 
-    preds_arr = np.concatenate(all_preds, axis=0)  # (n_seg, 234)
-
-    # 12セグメントに満たない場合は最後の行で埋める
-    if len(preds_arr) < 12:
-        pad = np.repeat(preds_arr[-1:], 12 - len(preds_arr), axis=0)
-        preds_arr = np.concatenate([preds_arr, pad], axis=0)
-
-    return preds_arr[:12]  # (12, 234)
+    return np.concatenate(all_preds, axis=0)  # (12, 234)
 
 
-def run_inference(perch_path: str, weights_dir: Path, tax: pd.DataFrame) -> pd.DataFrame:
+def run_inference(perch_path: str, weights_dir: Path, label_cols: list) -> pd.DataFrame:
     """5-fold アンサンブル推論 → submission DataFrame"""
     test_files = sorted(glob.glob(str(CFG.TEST_SOUNDSCAPE_DIR / "*.ogg")))
     print(f"Test files: {len(test_files)}")
-
-    label_cols = list(tax["primary_label"])
 
     if len(test_files) == 0:
         # 提出前の編集環境ではテストファイルが存在しない（提出時に差し替えられる）
@@ -167,7 +164,7 @@ def run_inference(perch_path: str, weights_dir: Path, tax: pd.DataFrame) -> pd.D
         return pd.DataFrame(columns=["row_id"] + label_cols)
 
     # fold毎に累積して最後に平均
-    fold_preds = {fp: np.zeros((12, CFG.N_CLASSES), dtype=np.float64) for fp in test_files}
+    fold_preds = {fp: np.zeros((12, CFG.N_CLASSES), dtype=np.float32) for fp in test_files}
 
     for fold in range(CFG.N_FOLDS):
         weights_path = weights_dir / f"best_model_fold{fold}.weights.h5"
@@ -210,22 +207,22 @@ def main():
     tf.config.set_visible_devices([], 'GPU')
     print("Using CPU only")
 
-    # Taxonomy
-    tax, _, _ = load_taxonomy()
-    print(f"Classes: {CFG.N_CLASSES}")
+    # [C2修正] label_cols は sample_submission.csv の列順を使う
+    label_cols = load_label_cols()
+    print(f"Classes: {len(label_cols)}")
 
-    # Perch モデルのダウンロード
-    print("\nDownloading Perch 2.0...")
+    # [C1修正] kagglehub.model_download はローカルキャッシュ or Kaggle内プロキシ経由で動作。
+    # インターネット不可でも、Notebookにモデルを入力として追加しておけばキャッシュから取得される。
+    print("\nLoading Perch 2.0...")
     perch_path = kagglehub.model_download(CFG.PERCH_HANDLE)
     print(f"Perch path: {perch_path}")
 
-    # 学習済み重みのダウンロード
-    print("\nDownloading trained weights...")
+    print("\nLoading trained weights...")
     weights_dir = Path(kagglehub.model_download(CFG.KAGGLE_MODEL_HANDLE))
     print(f"Weights dir: {weights_dir}")
 
     # 推論
-    submission = run_inference(perch_path, weights_dir, tax)
+    submission = run_inference(perch_path, weights_dir, label_cols)
 
     # 保存
     output_path = Path("/kaggle/working/submission.csv")
