@@ -511,8 +511,11 @@ def main():
     seed_everything(CFG.SEED)
     CFG.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # wandb ログイン（Kaggle Secrets に WANDB_API_KEY を設定しておくこと）
-    wandb.login(key=os.environ.get("WANDB_API_KEY", ""))
+    # wandb ログイン（Kaggle Secrets から API キーを取得）
+    from kaggle_secrets import UserSecretsClient
+    user_secrets = UserSecretsClient()
+    secret_value_0 = user_secrets.get_secret("wandb")
+    wandb.login(key=secret_value_0)
 
     # Perch 2.0 ダウンロード
     print("Downloading Perch 2.0...")
