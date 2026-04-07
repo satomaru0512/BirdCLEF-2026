@@ -186,7 +186,8 @@ def load_audio_chunk(filepath: str, start_sec: float = 0) -> np.ndarray:
             audio = audio[: CFG.N_SAMPLES]
 
         return audio.astype(np.float32)
-    except Exception:
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"[WARN] Failed to load {filepath} at {start_sec:.1f}s: {e}")
         return np.zeros(CFG.N_SAMPLES, dtype=np.float32)
 
 
@@ -309,11 +310,12 @@ def make_audio_dataset(
 ) -> tf.data.Dataset:
     """Stage2用: 音声波形のDataset（拡張あり）"""
     rows = df.to_dict("records")
-    if is_train:
-        random.shuffle(rows)
 
     def generator():
-        for row in rows:
+        shuffled = list(rows)
+        if is_train:
+            random.shuffle(shuffled)
+        for row in shuffled:
             audio = load_audio_chunk(row["filepath"], row["start_sec"])
             audio = augment_audio(audio, training=is_train)
             label = np.zeros(n_classes, dtype=np.float32)
@@ -441,8 +443,7 @@ def train_fold(
             best_weights_s1 = head_model.get_weights()
 
     # Stage1のheadの重みをfull_modelに転送
-    head_model.set_weights(best_weights_s1)
-    full_model.head.set_weights(head_model.get_weights())
+    full_model.head.set_weights(best_weights_s1)
 
     # メモリ解放
     del train_embs, val_embs, train_oh, val_oh, head_model
