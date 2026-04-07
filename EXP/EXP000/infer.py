@@ -1,0 +1,235 @@
+"""
+EXP000: BirdCLEF+ 2026 推論スクリプト
+- Backbone : Google Perch 2.0
+- 推論環境  : CPU only（Kaggle制約）
+- 入力     : test_soundscapes/ （1分 ogg × ~600ファイル）
+- 出力     : submission.csv（5秒セグメントごとの234種確率）
+- アンサンブル: 5-fold平均
+"""
+
+import glob
+from pathlib import Path
+
+import kagglehub
+import numpy as np
+import pandas as pd
+import soundfile as sf
+import tensorflow as tf
+from tqdm import tqdm
+
+
+# ============================================================
+# Config
+# ============================================================
+class CFG:
+    EXP_NAME  = "EXP000"
+    CHILD_EXP = "child-exp000"
+
+    # Audio
+    SAMPLE_RATE = 32000
+    DURATION    = 5
+    N_SAMPLES   = SAMPLE_RATE * DURATION  # 160_000
+
+    # Data paths (Kaggle環境)
+    DATA_DIR            = Path("/kaggle/input/competitions/birdclef-2026")
+    TEST_SOUNDSCAPE_DIR = DATA_DIR / "test_soundscapes"
+
+    # Classes
+    N_CLASSES = 234
+
+    # 推論バッチサイズ（CPU: 小さめ）
+    BATCH_SIZE = 8
+
+    # Kaggle Models からロードするモデル
+    KAGGLE_MODEL_HANDLE = "wasabi777/birdclef2026-exp000/tensorFlow2/perch-v2-baseline"
+    N_FOLDS = 5
+
+    # Perch
+    PERCH_HANDLE = (
+        "google/bird-vocalization-classifier"
+        "/tensorFlow2/bird-vocalization-classifier/2"
+    )
+
+
+# ============================================================
+# モデル定義（train.pyと同一構造）
+# ============================================================
+class PerchClassifier(tf.keras.Model):
+    """Perch 2.0 backbone + 分類ヘッド"""
+
+    def __init__(self, perch_path: str, n_classes: int):
+        super().__init__()
+        self.perch = tf.saved_model.load(perch_path)
+        self.head = tf.keras.Sequential([
+            tf.keras.layers.Dense(512, activation="relu", dtype="float32"),
+            tf.keras.layers.Dropout(0.5),
+            tf.keras.layers.Dense(n_classes, activation="sigmoid", dtype="float32"),
+        ], name="head")
+        self.head.build(input_shape=(None, 1280))
+
+    def _infer_perch_batch(self, waveform):
+        infer_fn = self.perch.signatures['serving_default']
+        waveform = tf.cast(waveform, tf.float32)
+        all_embs = []
+        for i in range(waveform.shape[0]):
+            single_audio = tf.expand_dims(waveform[i], 0)
+            outputs = infer_fn(inputs=single_audio)
+            all_embs.append(outputs['output_1'])
+        return tf.concat(all_embs, axis=0)
+
+    def call(self, waveform, training: bool = False):
+        embeddings = tf.cast(self._infer_perch_batch(waveform), tf.float32)
+        return self.head(embeddings, training=training)
+
+
+# ============================================================
+# Utilities
+# ============================================================
+def load_taxonomy():
+    tax = pd.read_csv(CFG.DATA_DIR / "taxonomy.csv")
+    label2idx = {label: idx for idx, label in enumerate(tax["primary_label"])}
+    idx2label = {idx: label for label, idx in label2idx.items()}
+    return tax, label2idx, idx2label
+
+
+def load_audio_full(filepath: str) -> np.ndarray:
+    """音声ファイルを全て読み込む（1分）"""
+    try:
+        audio, sr = sf.read(filepath)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sr != CFG.SAMPLE_RATE:
+            import librosa
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=CFG.SAMPLE_RATE)
+        return audio.astype(np.float32)
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"[WARN] Failed to load {filepath}: {e}")
+        return np.zeros(CFG.SAMPLE_RATE * 60, dtype=np.float32)
+
+
+def split_into_segments(audio: np.ndarray) -> list:
+    """1分音声を5秒セグメントに分割（最大12セグメント）"""
+    segments = []
+    n_seg = max(1, len(audio) // CFG.N_SAMPLES)
+    for i in range(n_seg):
+        start = i * CFG.N_SAMPLES
+        seg   = audio[start:start + CFG.N_SAMPLES]
+        if len(seg) < CFG.N_SAMPLES:
+            seg = np.pad(seg, (0, CFG.N_SAMPLES - len(seg)))
+        segments.append(seg)
+    return segments
+
+
+def parse_filename_to_row_ids(filepath: str) -> list:
+    """ファイル名から row_id リスト（end_time=5,10,...,60）を生成"""
+    stem = Path(filepath).stem
+    return [f"{stem}_{t}" for t in range(5, 65, 5)]
+
+
+# ============================================================
+# 推論
+# ============================================================
+def predict_file(model: PerchClassifier, filepath: str) -> np.ndarray:
+    """
+    1ファイル（1分）を推論
+    Returns: shape (12, N_CLASSES)
+    """
+    audio    = load_audio_full(filepath)
+    segments = split_into_segments(audio)
+
+    all_preds = []
+    for i in range(0, len(segments), CFG.BATCH_SIZE):
+        batch    = np.stack(segments[i:i + CFG.BATCH_SIZE])       # (B, 160000)
+        batch_tf = tf.constant(batch, dtype=tf.float32)
+        preds    = model(batch_tf, training=False).numpy()         # (B, 234)
+        all_preds.append(preds)
+
+    preds_arr = np.concatenate(all_preds, axis=0)  # (n_seg, 234)
+
+    # 12セグメントに満たない場合は最後の行で埋める
+    if len(preds_arr) < 12:
+        pad = np.repeat(preds_arr[-1:], 12 - len(preds_arr), axis=0)
+        preds_arr = np.concatenate([preds_arr, pad], axis=0)
+
+    return preds_arr[:12]  # (12, 234)
+
+
+def run_inference(perch_path: str, weights_dir: Path, tax: pd.DataFrame) -> pd.DataFrame:
+    """5-fold アンサンブル推論 → submission DataFrame"""
+    test_files = sorted(glob.glob(str(CFG.TEST_SOUNDSCAPE_DIR / "*.ogg")))
+    print(f"Test files: {len(test_files)}")
+    if len(test_files) == 0:
+        raise FileNotFoundError(f"No ogg files in {CFG.TEST_SOUNDSCAPE_DIR}")
+
+    label_cols = list(tax["primary_label"])
+
+    # fold毎に累積して最後に平均
+    fold_preds = {fp: np.zeros((12, CFG.N_CLASSES), dtype=np.float64) for fp in test_files}
+
+    for fold in range(CFG.N_FOLDS):
+        weights_path = weights_dir / f"best_model_fold{fold}.weights.h5"
+        print(f"\n[Fold {fold}] Loading: {weights_path}")
+
+        model = PerchClassifier(perch_path=perch_path, n_classes=CFG.N_CLASSES)
+        _ = model(tf.zeros((1, CFG.N_SAMPLES), dtype=tf.float32), training=False)
+        model.load_weights(str(weights_path))
+        model.trainable = False
+
+        for filepath in tqdm(test_files, desc=f"Fold {fold}"):
+            fold_preds[filepath] += predict_file(model, filepath)
+
+        del model
+
+    # 平均 → DataFrame
+    all_rows = []
+    for filepath in test_files:
+        avg_preds = fold_preds[filepath] / CFG.N_FOLDS  # (12, 234)
+        row_ids   = parse_filename_to_row_ids(filepath)
+        for seg_idx, row_id in enumerate(row_ids):
+            row = {"row_id": row_id}
+            for j, label in enumerate(label_cols):
+                row[label] = float(avg_preds[seg_idx, j])
+            all_rows.append(row)
+
+    submission = pd.DataFrame(all_rows)
+    return submission[["row_id"] + label_cols]
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    print("=" * 55)
+    print(f"EXP000 Inference: {CFG.CHILD_EXP}")
+    print("=" * 55)
+
+    # CPUのみ使用（Kaggle推論環境制約）
+    tf.config.set_visible_devices([], 'GPU')
+    print("Using CPU only")
+
+    # Taxonomy
+    tax, _, _ = load_taxonomy()
+    print(f"Classes: {CFG.N_CLASSES}")
+
+    # Perch モデルのダウンロード
+    print("\nDownloading Perch 2.0...")
+    perch_path = kagglehub.model_download(CFG.PERCH_HANDLE)
+    print(f"Perch path: {perch_path}")
+
+    # 学習済み重みのダウンロード
+    print("\nDownloading trained weights...")
+    weights_dir = Path(kagglehub.model_download(CFG.KAGGLE_MODEL_HANDLE))
+    print(f"Weights dir: {weights_dir}")
+
+    # 推論
+    submission = run_inference(perch_path, weights_dir, tax)
+
+    # 保存
+    output_path = Path("/kaggle/working/submission.csv")
+    submission.to_csv(output_path, index=False)
+    print(f"\nSubmission saved: {output_path}  shape={submission.shape}")
+    print(submission.head(3))
+
+
+if __name__ == "__main__":
+    main()
