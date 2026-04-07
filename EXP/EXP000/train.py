@@ -223,18 +223,22 @@ class PerchClassifier(tf.keras.Model):
             tf.keras.layers.Dense(n_classes, activation="sigmoid", dtype="float32"),
         ], name="head")
 
-    def _infer_perch(self, waveform):
+    def _infer_perch_batch(self, waveform):
+        """バッチ内の各サンプルを1つずつ処理してembeddingを返す"""
         infer_fn = self.perch.signatures['serving_default']
-        return infer_fn(waveform)
+        all_embs = []
+        for i in range(waveform.shape[0]):
+            single_audio = tf.expand_dims(waveform[i], 0)  # (1, 160000)
+            outputs = infer_fn(inputs=single_audio)
+            all_embs.append(outputs['output_1'])            # shape: (1, 1280)
+        return tf.concat(all_embs, axis=0)                  # (Batch, 1280)
 
     def call(self, waveform, training: bool = False):
-        outputs    = self._infer_perch(waveform)
-        embeddings = tf.cast(outputs["embeddings"], tf.float32)  # FP16→FP32
+        embeddings = tf.cast(self._infer_perch_batch(waveform), tf.float32)
         return self.head(embeddings, training=training)
 
     def get_embeddings(self, waveform):
-        outputs = self._infer_perch(waveform)
-        return tf.cast(outputs["embeddings"], tf.float32)
+        return tf.cast(self._infer_perch_batch(waveform), tf.float32)
 
     def freeze_perch(self):
         self.perch.trainable = False
