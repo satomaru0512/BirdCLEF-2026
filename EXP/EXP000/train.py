@@ -1,10 +1,11 @@
 """
 EXP000: BirdCLEF+ 2026 Baseline
 - Backbone : Google Perch 2.0 (bird-vocalization-classifier/2)
-- Strategy : Stage1 (Perch凍結, headのみ学習) → Stage2 (全体fine-tune)
+- Strategy : Stage1 (埋め込み事前計算 + headのみ学習) → Stage2 (全体fine-tune)
 - Data     : train_audio + labeled train_soundscapes
 - CV       : StratifiedKFold (5 folds)
 - Tracking : Weights & Biases
+- GPU最適化: Mixed Precision / @tf.function / マルチGPU / LR Warmup+Cosine
 """
 
 import gc
@@ -26,16 +27,38 @@ from tqdm import tqdm
 
 
 # ============================================================
+# GPU セットアップ
+# ============================================================
+def setup_gpu():
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"GPUs available: {len(gpus)}")
+    else:
+        print("No GPU found, using CPU")
+
+    # Mixed Precision (FP16) → 速度向上・メモリ節約
+    tf.keras.mixed_precision.set_global_policy("mixed_float16")
+    print("Mixed precision: mixed_float16")
+
+    # マルチGPU戦略
+    strategy = tf.distribute.MirroredStrategy() if len(gpus) > 1 else tf.distribute.get_strategy()
+    print(f"Strategy: {strategy.__class__.__name__}  replicas={strategy.num_replicas_in_sync}")
+    return strategy
+
+
+# ============================================================
 # Config
 # ============================================================
 class CFG:
-    EXP_NAME   = "EXP000"
-    CHILD_EXP  = "child-exp000"
+    EXP_NAME  = "EXP000"
+    CHILD_EXP = "child-exp000"
 
     # Audio
     SAMPLE_RATE = 32000
-    DURATION    = 5                          # seconds per chunk
-    N_SAMPLES   = SAMPLE_RATE * DURATION     # 160_000
+    DURATION    = 5                       # seconds
+    N_SAMPLES   = SAMPLE_RATE * DURATION  # 160_000
 
     # Model
     PERCH_HANDLE = (
@@ -44,20 +67,30 @@ class CFG:
     )
 
     # Data paths (Kaggle環境)
-    DATA_DIR            = Path("/kaggle/input/birdclef-2026")
-    TRAIN_AUDIO_DIR     = DATA_DIR / "train_audio"
+    DATA_DIR              = Path("/kaggle/input/birdclef-2026")
+    TRAIN_AUDIO_DIR       = DATA_DIR / "train_audio"
     TRAIN_SOUNDSCAPES_DIR = DATA_DIR / "train_soundscapes"
-    OUTPUT_DIR          = Path(f"./outputs/{CHILD_EXP}")
+    OUTPUT_DIR            = Path(f"./outputs/{CHILD_EXP}")
 
     # Classes
     N_CLASSES = 234
 
-    # Training
-    BATCH_SIZE      = 32
-    EPOCHS_HEAD     = 10   # Stage1: headのみ
-    EPOCHS_FINETUNE = 5    # Stage2: 全体fine-tune
-    LR_HEAD         = 1e-3
-    LR_FINETUNE     = 1e-5
+    # Training - Stage 1 (head only, 埋め込みキャッシュ使用)
+    BATCH_SIZE_HEAD  = 512   # 埋め込みはメモリ効率が良いので大きく
+    EPOCHS_HEAD      = 20
+    LR_HEAD          = 1e-3
+    WARMUP_EPOCHS_HEAD = 2
+
+    # Training - Stage 2 (full fine-tune)
+    BATCH_SIZE_FINETUNE  = 64    # 音声→Perch→headの全体、メモリ多いので適度に
+    EPOCHS_FINETUNE      = 10
+    LR_FINETUNE          = 5e-5
+    WARMUP_EPOCHS_FT     = 1
+    GRAD_CLIP_NORM       = 1.0   # 勾配クリッピング
+
+    # Augmentation
+    NOISE_STD   = 0.005  # ガウスノイズ標準偏差
+    TIME_SHIFT  = 0.1    # 時間シフト最大割合
 
     # Cross-Validation
     N_FOLDS = 5
@@ -77,9 +110,16 @@ def seed_everything(seed: int = CFG.SEED) -> None:
 
 
 def hms_to_seconds(hms: str) -> int:
-    """'HH:MM:SS' → 秒数"""
     parts = hms.split(":")
     return sum(int(x) * (60 ** i) for i, x in enumerate(reversed(parts)))
+
+
+def cosine_decay_with_warmup(epoch, total_epochs, warmup_epochs, lr_max):
+    """Warmup + Cosine Decay スケジューラ"""
+    if epoch < warmup_epochs:
+        return lr_max * (epoch + 1) / warmup_epochs
+    progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+    return lr_max * 0.5 * (1.0 + np.cos(np.pi * progress))
 
 
 # ============================================================
@@ -93,7 +133,6 @@ def load_taxonomy():
 
 
 def prepare_train_audio(train_csv: pd.DataFrame, label2idx: dict) -> pd.DataFrame:
-    """train_audio のメタデータを整形"""
     df = train_csv.copy()
     df["label_idx"] = df["primary_label"].map(label2idx)
     df = df.dropna(subset=["label_idx"])
@@ -104,7 +143,6 @@ def prepare_train_audio(train_csv: pd.DataFrame, label2idx: dict) -> pd.DataFram
 
 
 def prepare_train_soundscapes(labels_csv: pd.DataFrame, label2idx: dict) -> pd.DataFrame:
-    """train_soundscapes_labels.csv を5秒セグメント単位に展開"""
     records = []
     for _, row in labels_csv.iterrows():
         filepath  = str(CFG.TRAIN_SOUNDSCAPES_DIR / row["filename"])
@@ -122,36 +160,50 @@ def prepare_train_soundscapes(labels_csv: pd.DataFrame, label2idx: dict) -> pd.D
 
 
 # ============================================================
-# Audio Loading
+# Audio Loading & Augmentation
 # ============================================================
 def load_audio_chunk(filepath: str, start_sec: float = 0) -> np.ndarray:
-    """音声ファイルから5秒チャンクを読み込む"""
     try:
-        info       = sf.info(filepath)
-        orig_sr    = info.samplerate
+        info        = sf.info(filepath)
+        orig_sr     = info.samplerate
         start_frame = int(start_sec * orig_sr)
-        n_frames   = int(CFG.DURATION * orig_sr)
+        n_frames    = int(CFG.DURATION * orig_sr)
 
         audio, _ = sf.read(filepath, start=start_frame, frames=n_frames)
         if audio.ndim > 1:
-            audio = audio.mean(axis=1)          # stereo → mono
+            audio = audio.mean(axis=1)
         if orig_sr != CFG.SAMPLE_RATE:
             audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=CFG.SAMPLE_RATE)
 
-        # パディング or トリミング
         if len(audio) < CFG.N_SAMPLES:
             audio = np.pad(audio, (0, CFG.N_SAMPLES - len(audio)))
         else:
             audio = audio[: CFG.N_SAMPLES]
 
         return audio.astype(np.float32)
-
     except Exception:
         return np.zeros(CFG.N_SAMPLES, dtype=np.float32)
 
 
+def augment_audio(audio: np.ndarray, training: bool = True) -> np.ndarray:
+    """音声データ拡張（学習時のみ）"""
+    if not training:
+        return audio
+
+    # ガウスノイズ付加
+    if random.random() < 0.5:
+        audio = audio + np.random.normal(0, CFG.NOISE_STD, audio.shape).astype(np.float32)
+
+    # 時間シフト
+    if random.random() < 0.5:
+        shift = int(random.uniform(-CFG.TIME_SHIFT, CFG.TIME_SHIFT) * CFG.N_SAMPLES)
+        audio = np.roll(audio, shift)
+
+    return audio
+
+
 # ============================================================
-# Model
+# モデル
 # ============================================================
 class PerchClassifier(tf.keras.Model):
     """Perch 2.0 backbone + 分類ヘッド"""
@@ -159,17 +211,22 @@ class PerchClassifier(tf.keras.Model):
     def __init__(self, perch_path: str, n_classes: int):
         super().__init__()
         self.perch = tf.saved_model.load(perch_path)
-        self.head  = tf.keras.Sequential([
-            tf.keras.layers.Dense(512, activation="relu"),
+        # ヘッド（出力はfloat32に戻す）
+        self.head = tf.keras.Sequential([
+            tf.keras.layers.Dense(512, activation="relu", dtype="float32"),
             tf.keras.layers.Dropout(0.5),
-            tf.keras.layers.Dense(n_classes, activation="sigmoid"),
+            tf.keras.layers.Dense(n_classes, activation="sigmoid", dtype="float32"),
         ], name="head")
 
     def call(self, waveform, training: bool = False):
         # NOTE: Perch 2.0 の API が異なる場合はここを修正
         outputs    = self.perch.infer(waveform)
-        embeddings = outputs["embeddings"]          # (batch, embedding_dim)
+        embeddings = tf.cast(outputs["embeddings"], tf.float32)  # FP16→FP32
         return self.head(embeddings, training=training)
+
+    def get_embeddings(self, waveform):
+        outputs = self.perch.infer(waveform)
+        return tf.cast(outputs["embeddings"], tf.float32)
 
     def freeze_perch(self):
         self.perch.trainable = False
@@ -178,11 +235,67 @@ class PerchClassifier(tf.keras.Model):
         self.perch.trainable = True
 
 
+class EmbeddingClassifier(tf.keras.Model):
+    """Stage1用: 事前計算した埋め込みから分類するモデル"""
+
+    def __init__(self, embedding_dim: int, n_classes: int):
+        super().__init__()
+        self.head = tf.keras.Sequential([
+            tf.keras.layers.Dense(512, activation="relu"),
+            tf.keras.layers.Dropout(0.5),
+            tf.keras.layers.Dense(n_classes, activation="sigmoid"),
+        ], name="head")
+
+    def call(self, embeddings, training: bool = False):
+        return self.head(embeddings, training=training)
+
+
+# ============================================================
+# 埋め込み事前計算（Stage1高速化の核心）
+# ============================================================
+def precompute_embeddings(
+    df: pd.DataFrame,
+    perch_model,
+    batch_size: int = 128,
+    training: bool = False,
+) -> np.ndarray:
+    """全サンプルのPerch埋め込みを一括計算してキャッシュ"""
+    rows = df.to_dict("records")
+    all_embeddings = []
+
+    for i in tqdm(range(0, len(rows), batch_size), desc="Precomputing embeddings"):
+        batch_rows = rows[i: i + batch_size]
+        waveforms  = np.stack([
+            load_audio_chunk(r["filepath"], r["start_sec"]) for r in batch_rows
+        ])
+        waveforms_tf = tf.constant(waveforms)
+        embeddings   = perch_model.get_embeddings(waveforms_tf).numpy()
+        all_embeddings.append(embeddings)
+
+    return np.concatenate(all_embeddings, axis=0)
+
+
 # ============================================================
 # tf.data.Dataset
 # ============================================================
-def make_dataset(df: pd.DataFrame, label2idx: dict, is_train: bool = True):
-    n_classes = len(label2idx)
+def make_embedding_dataset(
+    embeddings: np.ndarray,
+    labels_onehot: np.ndarray,
+    is_train: bool = True,
+) -> tf.data.Dataset:
+    """Stage1用: 埋め込みとラベルのDataset"""
+    ds = tf.data.Dataset.from_tensor_slices((embeddings, labels_onehot))
+    if is_train:
+        ds = ds.shuffle(len(embeddings))
+    return ds.batch(CFG.BATCH_SIZE_HEAD).prefetch(tf.data.AUTOTUNE)
+
+
+def make_audio_dataset(
+    df: pd.DataFrame,
+    n_classes: int,
+    is_train: bool = True,
+) -> tf.data.Dataset:
+    """Stage2用: 音声波形のDataset（拡張あり）"""
     rows = df.to_dict("records")
     if is_train:
         random.shuffle(rows)
@@ -190,6 +303,7 @@ def make_dataset(df: pd.DataFrame, label2idx: dict, is_train: bool = True):
     def generator():
         for row in rows:
             audio = load_audio_chunk(row["filepath"], row["start_sec"])
+            audio = augment_audio(audio, training=is_train)
             label = np.zeros(n_classes, dtype=np.float32)
             label[int(row["label_idx"])] = 1.0
             yield audio, label
@@ -203,17 +317,34 @@ def make_dataset(df: pd.DataFrame, label2idx: dict, is_train: bool = True):
     )
     if is_train:
         ds = ds.shuffle(2000)
-    return ds.batch(CFG.BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    return (
+        ds.batch(CFG.BATCH_SIZE_FINETUNE)
+          .prefetch(tf.data.AUTOTUNE)
+    )
 
 
 # ============================================================
-# Evaluation
+# 学習ステップ（@tf.function でグラフ実行）
 # ============================================================
-def compute_auc(model: PerchClassifier, dataset) -> float:
-    """Macro ROC-AUC（ラベルが存在するクラスのみ）"""
+@tf.function
+def train_step(model, optimizer, loss_fn, x, y):
+    with tf.GradientTape() as tape:
+        preds = model(x, training=True)
+        loss  = loss_fn(y, preds)
+    grads = tape.gradient(loss, model.trainable_variables)
+    # 勾配クリッピング
+    grads, _ = tf.clip_by_global_norm(grads, CFG.GRAD_CLIP_NORM)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    return loss
+
+
+# ============================================================
+# 評価
+# ============================================================
+def compute_auc(model, dataset) -> float:
     all_preds, all_labels = [], []
-    for waveforms, labels in dataset:
-        preds = model(waveforms, training=False).numpy()
+    for x, labels in dataset:
+        preds = model(x, training=False).numpy()
         all_preds.append(preds)
         all_labels.append(labels.numpy())
 
@@ -226,6 +357,13 @@ def compute_auc(model: PerchClassifier, dataset) -> float:
     return roc_auc_score(all_labels[:, valid], all_preds[:, valid], average="macro")
 
 
+def labels_to_onehot(df: pd.DataFrame, n_classes: int) -> np.ndarray:
+    onehot = np.zeros((len(df), n_classes), dtype=np.float32)
+    for i, idx in enumerate(df["label_idx"].values):
+        onehot[i, int(idx)] = 1.0
+    return onehot
+
+
 # ============================================================
 # Fold Training
 # ============================================================
@@ -235,8 +373,10 @@ def train_fold(
     val_df: pd.DataFrame,
     perch_path: str,
     label2idx: dict,
+    strategy,
 ) -> float:
-    print(f"\n{'='*50}\nFold {fold}\n{'='*50}")
+    print(f"\n{'='*55}\nFold {fold}\n{'='*55}")
+    n_classes = CFG.N_CLASSES
 
     run = wandb.init(
         project=CFG.WANDB_PROJECT,
@@ -245,68 +385,96 @@ def train_fold(
         reinit=True,
     )
 
-    train_ds = make_dataset(train_df, label2idx, is_train=True)
-    val_ds   = make_dataset(val_df,   label2idx, is_train=False)
-
-    model   = PerchClassifier(perch_path=perch_path, n_classes=CFG.N_CLASSES)
-    loss_fn = tf.keras.losses.BinaryCrossentropy()
-    best_auc, best_weights = 0.0, None
+    # ---- Perch モデルをロード ----
+    with strategy.scope():
+        full_model = PerchClassifier(perch_path=perch_path, n_classes=n_classes)
+        full_model.freeze_perch()
 
     # ----------------------------------------------------------
-    # Stage 1: head のみ学習（Perch凍結）
+    # Stage 1: 埋め込み事前計算 → headのみ高速学習
     # ----------------------------------------------------------
-    model.freeze_perch()
-    optimizer = tf.keras.optimizers.Adam(CFG.LR_HEAD)
+    print("\n[Stage 1] Precomputing embeddings...")
+    train_embs = precompute_embeddings(train_df, full_model)
+    val_embs   = precompute_embeddings(val_df,   full_model)
+    train_oh   = labels_to_onehot(train_df, n_classes)
+    val_oh     = labels_to_onehot(val_df,   n_classes)
+
+    print(f"  train embeddings: {train_embs.shape}")
+
+    emb_dim = train_embs.shape[1]
+    with strategy.scope():
+        head_model = EmbeddingClassifier(embedding_dim=emb_dim, n_classes=n_classes)
+        loss_fn    = tf.keras.losses.BinaryCrossentropy()
+
+    best_auc_s1, best_weights_s1 = 0.0, None
+    train_emb_ds = make_embedding_dataset(train_embs, train_oh, is_train=True)
+    val_emb_ds   = make_embedding_dataset(val_embs,   val_oh,   is_train=False)
 
     for epoch in range(CFG.EPOCHS_HEAD):
+        lr = cosine_decay_with_warmup(epoch, CFG.EPOCHS_HEAD, CFG.WARMUP_EPOCHS_HEAD, CFG.LR_HEAD)
+        optimizer = tf.keras.optimizers.Adam(lr)
         total_loss = 0.0
-        for waveforms, labels in tqdm(train_ds, desc=f"[F{fold}] Head {epoch+1}/{CFG.EPOCHS_HEAD}"):
-            with tf.GradientTape() as tape:
-                preds = model(waveforms, training=True)
-                loss  = loss_fn(labels, preds)
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            total_loss += loss.numpy()
 
-        val_auc = compute_auc(model, val_ds)
-        print(f"  loss={total_loss:.4f}  val_auc={val_auc:.4f}")
+        for embs, labels in tqdm(train_emb_ds, desc=f"[F{fold}] S1 Epoch {epoch+1}/{CFG.EPOCHS_HEAD}"):
+            total_loss += train_step(head_model, optimizer, loss_fn, embs, labels).numpy()
+
+        val_auc = compute_auc(head_model, val_emb_ds)
+        print(f"  lr={lr:.2e}  loss={total_loss:.4f}  val_auc={val_auc:.4f}")
         wandb.log({"fold": fold, "epoch": epoch, "stage": "head",
-                   "train_loss": total_loss, "val_auc": val_auc})
+                   "lr": lr, "train_loss": total_loss, "val_auc": val_auc})
 
-        if val_auc > best_auc:
-            best_auc, best_weights = val_auc, model.get_weights()
+        if val_auc > best_auc_s1:
+            best_auc_s1    = val_auc
+            best_weights_s1 = head_model.get_weights()
+
+    # Stage1のheadの重みをfull_modelに転送
+    head_model.set_weights(best_weights_s1)
+    full_model.head.set_weights(head_model.get_weights())
+
+    # メモリ解放
+    del train_embs, val_embs, train_oh, val_oh, head_model
+    gc.collect()
 
     # ----------------------------------------------------------
     # Stage 2: 全体 fine-tune
     # ----------------------------------------------------------
-    model.unfreeze_perch()
-    optimizer = tf.keras.optimizers.Adam(CFG.LR_FINETUNE)
+    print(f"\n[Stage 2] Full fine-tuning  (best S1 AUC={best_auc_s1:.4f})")
+    full_model.unfreeze_perch()
+
+    train_audio_ds = make_audio_dataset(train_df, n_classes, is_train=True)
+    val_audio_ds   = make_audio_dataset(val_df,   n_classes, is_train=False)
+
+    with strategy.scope():
+        loss_fn = tf.keras.losses.BinaryCrossentropy()
+
+    best_auc, best_weights = best_auc_s1, full_model.get_weights()
 
     for epoch in range(CFG.EPOCHS_FINETUNE):
+        lr = cosine_decay_with_warmup(epoch, CFG.EPOCHS_FINETUNE, CFG.WARMUP_EPOCHS_FT, CFG.LR_FINETUNE)
+        optimizer = tf.keras.optimizers.Adam(lr)
         total_loss = 0.0
-        for waveforms, labels in tqdm(train_ds, desc=f"[F{fold}] FT {epoch+1}/{CFG.EPOCHS_FINETUNE}"):
-            with tf.GradientTape() as tape:
-                preds = model(waveforms, training=True)
-                loss  = loss_fn(labels, preds)
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            total_loss += loss.numpy()
 
-        val_auc = compute_auc(model, val_ds)
-        print(f"  loss={total_loss:.4f}  val_auc={val_auc:.4f}")
+        for waveforms, labels in tqdm(train_audio_ds, desc=f"[F{fold}] S2 Epoch {epoch+1}/{CFG.EPOCHS_FINETUNE}"):
+            total_loss += train_step(full_model, optimizer, loss_fn, waveforms, labels).numpy()
+
+        val_auc = compute_auc(full_model, val_audio_ds)
+        print(f"  lr={lr:.2e}  loss={total_loss:.4f}  val_auc={val_auc:.4f}")
         wandb.log({"fold": fold, "epoch": epoch + CFG.EPOCHS_HEAD, "stage": "finetune",
-                   "train_loss": total_loss, "val_auc": val_auc})
+                   "lr": lr, "train_loss": total_loss, "val_auc": val_auc})
 
         if val_auc > best_auc:
-            best_auc, best_weights = val_auc, model.get_weights()
+            best_auc, best_weights = val_auc, full_model.get_weights()
 
     # ベストモデルを保存
-    model.set_weights(best_weights)
-    model.save_weights(str(CFG.OUTPUT_DIR / f"best_model_fold{fold}.weights.h5"))
+    full_model.set_weights(best_weights)
+    full_model.save_weights(str(CFG.OUTPUT_DIR / f"best_model_fold{fold}.weights.h5"))
     print(f"Fold {fold} best val AUC: {best_auc:.4f}")
 
     wandb.log({"fold": fold, "best_val_auc": best_auc})
     wandb.finish()
+
+    del full_model
+    gc.collect()
 
     return best_auc
 
@@ -315,6 +483,7 @@ def train_fold(
 # Main
 # ============================================================
 def main():
+    strategy = setup_gpu()
     seed_everything(CFG.SEED)
     CFG.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -347,7 +516,7 @@ def main():
         train_df = all_df.iloc[train_idx].reset_index(drop=True)
         val_df   = all_df.iloc[val_idx].reset_index(drop=True)
 
-        fold_auc = train_fold(fold, train_df, val_df, perch_path, label2idx)
+        fold_auc = train_fold(fold, train_df, val_df, perch_path, label2idx, strategy)
         oof_aucs.append(fold_auc)
         gc.collect()
 
