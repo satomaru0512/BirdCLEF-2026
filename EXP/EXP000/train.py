@@ -229,6 +229,7 @@ class PerchClassifier(tf.keras.Model):
     def _infer_perch_batch(self, waveform):
         """バッチ内の各サンプルを1つずつ処理してembeddingを返す"""
         infer_fn = self.perch.signatures['serving_default']
+        waveform = tf.cast(waveform, tf.float32)  # Mixed Precision対策: Perchはfloat32のみ受付
         all_embs = []
         for i in range(waveform.shape[0]):
             single_audio = tf.expand_dims(waveform[i], 0)  # (1, 160000)
