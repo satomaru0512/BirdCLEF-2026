@@ -223,13 +223,17 @@ class PerchClassifier(tf.keras.Model):
             tf.keras.layers.Dense(n_classes, activation="sigmoid", dtype="float32"),
         ], name="head")
 
+    def _infer_perch(self, waveform):
+        infer_fn = self.perch.signatures['serving_default']
+        return infer_fn(waveform)
+
     def call(self, waveform, training: bool = False):
-        outputs    = self.perch(waveform)
+        outputs    = self._infer_perch(waveform)
         embeddings = tf.cast(outputs["embeddings"], tf.float32)  # FP16→FP32
         return self.head(embeddings, training=training)
 
     def get_embeddings(self, waveform):
-        outputs = self.perch(waveform)
+        outputs = self._infer_perch(waveform)
         return tf.cast(outputs["embeddings"], tf.float32)
 
     def freeze_perch(self):
