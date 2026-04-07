@@ -338,7 +338,6 @@ def make_audio_dataset(
 # ============================================================
 # 学習ステップ（@tf.function でグラフ実行）
 # ============================================================
-@tf.function
 def train_step(model, optimizer, loss_fn, x, y):
     with tf.GradientTape() as tape:
         preds = model(x, training=True)
@@ -422,9 +421,11 @@ def train_fold(
     train_emb_ds = make_embedding_dataset(train_embs, train_oh, is_train=True)
     val_emb_ds   = make_embedding_dataset(val_embs,   val_oh,   is_train=False)
 
+    optimizer_s1 = tf.keras.optimizers.Adam(CFG.LR_HEAD)
     for epoch in range(CFG.EPOCHS_HEAD):
         lr = cosine_decay_with_warmup(epoch, CFG.EPOCHS_HEAD, CFG.WARMUP_EPOCHS_HEAD, CFG.LR_HEAD)
-        optimizer = tf.keras.optimizers.Adam(lr)
+        optimizer_s1.learning_rate.assign(lr)
+        optimizer = optimizer_s1
         total_loss = 0.0
 
         for embs, labels in tqdm(train_emb_ds, desc=f"[F{fold}] S1 Epoch {epoch+1}/{CFG.EPOCHS_HEAD}"):
@@ -461,9 +462,11 @@ def train_fold(
 
     best_auc, best_weights = best_auc_s1, full_model.get_weights()
 
+    optimizer_s2 = tf.keras.optimizers.Adam(CFG.LR_FINETUNE)
     for epoch in range(CFG.EPOCHS_FINETUNE):
         lr = cosine_decay_with_warmup(epoch, CFG.EPOCHS_FINETUNE, CFG.WARMUP_EPOCHS_FT, CFG.LR_FINETUNE)
-        optimizer = tf.keras.optimizers.Adam(lr)
+        optimizer_s2.learning_rate.assign(lr)
+        optimizer = optimizer_s2
         total_loss = 0.0
 
         for waveforms, labels in tqdm(train_audio_ds, desc=f"[F{fold}] S2 Epoch {epoch+1}/{CFG.EPOCHS_FINETUNE}"):
