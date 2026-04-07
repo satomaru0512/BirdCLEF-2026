@@ -1,4 +1,4 @@
-# CLAUDE.md　ういー
+# CLAUDE.md　
 
 このファイルは、リポジトリ内のコードを扱う際の Claude Code (claude.ai/code) へのガイダンスを提供します。
 
@@ -13,10 +13,41 @@
 - 学習は Kaggle Notebooks 上の `execute_train.ipynb` で実行
 - データは `/kaggle/input/competitions/birdclef-2026` で利用可能
 - 学習済みモデルは `kagglehub` 経由で Kaggle Models にアップロード
+- **学習は GPU 使用可能**（Kaggle GPU ノートブックを利用）
 
 **推論環境**: Kaggle Notebooks
 - 推論スクリプトは Kaggle の提出環境で動作するよう設計
 - Kaggle の制約（実行時間 ≤9時間、インターネット不可）を遵守すること
+- **推論は CPU のみ使用可能**（GPU は使用不可）。CPUでの実行速度を考慮した設計にすること
+
+## 実験追跡: Weights & Biases (wandb)
+
+**全ての学習・推論実験は [wandb.ai](https://wandb.ai) で管理する。**
+
+### 基本方針
+- 学習スクリプト (`train.py`) には必ず `wandb` のログ記録を組み込むこと
+- 推論スクリプト (`infer.py`) の評価結果も wandb に記録すること
+- 実験名は `EXP{exp_no}/child-exp{child_no}` の形式で統一する（例: `EXP000/child-exp000`）
+
+### wandb に記録すべき情報
+**学習時:**
+- ハイパーパラメータ（config の全パラメータ）
+- エポックごとの loss、CV スコア（OOF ROC-AUC）
+- フォールドごとのスコア
+- モデルのアーキテクチャ情報
+
+**推論・評価時:**
+- CV スコア（OOF）
+- LB スコア（ユーザーが報告したもの）
+- LB-CV ギャップ
+
+### 実装時の注意
+- `wandb.init()` の `project` は `"birdclef-2026"` で統一
+- `wandb.init()` の `name` は実験名（例: `"EXP000-child-exp000"`）
+- configファイルの内容を `wandb.config.update(config)` で記録
+- Kaggle Notebooks での実行時は `WANDB_API_KEY` をシークレットから取得すること
+
+---
 
 ## 実験結果の管理
 
@@ -94,6 +125,65 @@ BirdCLEF+ 2026/
             └── child-exp000/    # 実験出力（OOF予測など）
 ```
 
+##　コンペデータ
+
+### タスク概要
+
+ブラジルの**パンタナール湿原**で録音された音声の中で、どの種が鳴いているかを特定する。対象は**鳥類・両生類・哺乳類・爬虫類・昆虫**の5クラス（鳥だけではない）。
+
+### ファイル一覧
+
+#### train_audio/
+- xeno-canto / iNaturalist から収集した**単種の短い録音**
+- 32kHz・ogg形式にリサンプリング済み
+- ファイル名: `[collection][file_id].ogg`（例: `iNat1216197.ogg`）
+- **207種・35,549ファイル**
+
+#### train_soundscapes/
+- テストと同じ録音場所からの**長尺サウンドスケープ音声**（1分・32kHz・ogg）
+- **10,658ファイル**
+- 一部が専門家によってラベル付けされており、`train_soundscapes_labels.csv` で提供
+
+#### train_soundscapes_labels.csv
+- `train_soundscapes` のラベル付きサブセット
+- 5秒刻みのセグメントごとにラベルが付与
+- 列: `filename`, `start`, `end`, `primary_label`（複数種はセミコロン区切り）
+
+#### test_soundscapes/
+- 採点用の約**600ファイル**（1分・32kHz・ogg）
+- **Kaggle提出時のみ**ディレクトリに展開される（ローカルでは `readme.txt` のみ）
+- ファイル名形式: `BC2026_Test_<file_id>_<site>_<date>_<time_UTC>.ogg`
+  - 例: `BC2026_Test_0001_S05_20250227_010002.ogg`
+
+#### train.csv
+- `train_audio` の全ファイルに対するメタデータ（35,549行）
+- 主要列:
+  - `primary_label`: 種コード（鳥類はeBirdコード、鳥類以外はiNaturalist分類群ID）
+  - `secondary_labels`: 録音中に出現する他の種のリスト（不完全な場合あり）
+  - `latitude` / `longitude`: 録音場所の座標
+  - `rating`: Xeno-cantoの品質評価（1〜5、0は評価なし、iNatは評価なし）
+  - `filename`: 対応する音声ファイル名
+  - `collection`: `XC`（Xeno-canto）または `iNat`（iNaturalist）
+
+#### sample_submission.csv
+- 提出フォーマットのサンプル（3行）
+- `row_id`: `[soundscape_filename]_[end_time]`（例: `BC2026_Test_0001_S05_20250227_010002_20`）
+- 残り234列: 各種の存在確率
+
+#### taxonomy.csv
+- 234種の分類情報（`primary_label`, `inat_taxon_id`, `scientific_name`, `common_name`, `class_name`）
+- 提出ファイルの234クラス列と対応
+
+#### recording_location.txt
+- 録音場所の概要情報（パンタナール、ブラジル）
+- 座標範囲: 緯度 -16.5〜-21.6、経度 -55.9〜-57.6
+
+### 重要な注意事項
+
+- **`train_audio` にない種がテストに出現する可能性がある**: `train_soundscapes` のみでしか学習できない種が存在する
+- **昆虫のソノタイプ**: 多くの昆虫は種レベルで識別されておらず、ソノタイプ（例: `47158son16`）として扱われる。これらもクラスとして評価対象になる
+- **全学習種がテストに出現するわけではない**: 評価指標の仕様により、テストに出現しない種はスコアから除外される
+
 ## 実験管理
 
 ### 主要実験（スクリプト変更あり）
@@ -145,6 +235,12 @@ BirdCLEF+ 2026/
    - `if config.get('new_feature_enabled', False):` のようにデフォルトで無効
 
 ## 主要なアーキテクチャ設計
+
+### 採用基盤モデル一覧
+
+| モデル | バージョン | 提供元 | 備考 |
+|--------|-----------|--------|------|
+| Perch | 2.0 | Google | 鳥類音声分類に特化した音響基盤モデル |
 
 ### モデルアーキテクチャ
 
