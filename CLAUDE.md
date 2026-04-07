@@ -62,27 +62,39 @@
 ## リポジトリ構成
 
 ```
-csiro-biomass/
-├── docs/
-│   ├── OVERVIEW.md          # コンペティションの説明とルール
-│   └── DATASET.md           # データセットの説明とファイル形式
+BirdCLEF+ 2026/
+├── CLAUDE.md
+├── EXECUTE_TRAIN_README.md
+├── execute_train.ipynb          # Kaggle学習実行ノートブック
+├── final-inferece.ipynb         # 最終推論ノートブック
 ├── input/
-│   └── csiro-biomass/       # データセットファイル（train.csv, test.csv, 画像）
-├── EXP/
-│   ├── EXP000/              # ベースライン実験
-│   │   ├── train.py         # 学習スクリプト（Colab で実行）
-│   │   ├── infer.py         # 推論スクリプト（Kaggle で実行）
-│   │   └── config/
-│   │       ├── child-exp000.yaml  # 小規模実験のパラメータバリエーション
-│   │       └── child-exp001.yaml  # 各 child-exp は同じ train.py を使用
-│   ├── EXP001/              # 主要なアーキテクチャ変更
-│   │   ├── train.py
-│   │   └── infer.py
-│   └── EXP{exp_no}/         # 追加実験
-│       ├── train.py         # 必須: 学習スクリプト
-│       └── infer.py         # 必須: 推論スクリプト
-├── notebooks/               # （レガシー）旧ノートブックベースの実験
-└── scripts/                 # ユーティリティスクリプト
+│   └── birdclef-2026/           # コンペデータ（.gitignore対象）
+│       ├── train.csv
+│       ├── taxonomy.csv
+│       ├── sample_submission.csv
+│       ├── recording_location.txt
+│       ├── train_audio/         # 学習用音声ファイル
+│       ├── train_soundscapes/   # 学習用サウンドスケープ
+│       ├── train_soundscapes_labels.csv
+│       └── test_soundscapes/    # テスト用サウンドスケープ
+├── outputs/
+│   └── CV_LB/                   # CV vs LB 分析結果
+│       └── STATE_SEASON/
+├── docs/
+│   ├── OVERVIEW.md              # コンペティションの説明とルール
+│   ├── DATASET.md               # データセットの説明とファイル形式
+│   ├── papers/
+│   │   └── HOSTPAPER.md
+│   └── Idea_Research/           # 調査・アイデアメモ
+└── EXP/
+    ├── EXP_SUMMARY.md           # 全実験の結果サマリ
+    └── EXP000/                  # ベースライン実験
+        ├── train.py             # 学習スクリプト（Kaggle で実行）
+        ├── infer.py             # 推論スクリプト（Kaggle で実行）
+        ├── infer_ttt.py         # TTT推論スクリプト
+        ├── config/              # ハイパーパラメータ設定ファイル
+        └── outputs/
+            └── child-exp000/    # 実験出力（OOF予測など）
 ```
 
 ## 実験管理
