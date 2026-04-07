@@ -445,6 +445,8 @@ def train_fold(
             best_weights_s1 = head_model.get_weights()
 
     # Stage1のheadの重みをfull_modelに転送
+    # ダミー入力でfull_model全体をビルドしてからset_weights
+    _ = full_model(tf.zeros((1, CFG.N_SAMPLES), dtype=tf.float32), training=False)
     full_model.head.set_weights(best_weights_s1)
 
     # メモリ解放
