@@ -67,7 +67,7 @@ class CFG:
     )
 
     # Data paths (Kaggle環境)
-    DATA_DIR              = Path("/kaggle/input/birdclef-2026")
+    DATA_DIR              = Path("/kaggle/input/competitions/birdclef-2026")
     TRAIN_AUDIO_DIR       = DATA_DIR / "train_audio"
     TRAIN_SOUNDSCAPES_DIR = DATA_DIR / "train_soundscapes"
     OUTPUT_DIR            = Path(f"./outputs/{CHILD_EXP}")
