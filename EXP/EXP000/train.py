@@ -224,13 +224,12 @@ class PerchClassifier(tf.keras.Model):
         ], name="head")
 
     def call(self, waveform, training: bool = False):
-        # NOTE: Perch 2.0 の API が異なる場合はここを修正
-        outputs    = self.perch.infer(waveform)
+        outputs    = self.perch(waveform)
         embeddings = tf.cast(outputs["embeddings"], tf.float32)  # FP16→FP32
         return self.head(embeddings, training=training)
 
     def get_embeddings(self, waveform):
-        outputs = self.perch.infer(waveform)
+        outputs = self.perch(waveform)
         return tf.cast(outputs["embeddings"], tf.float32)
 
     def freeze_perch(self):
