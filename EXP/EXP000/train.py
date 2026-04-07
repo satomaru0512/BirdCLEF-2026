@@ -82,8 +82,9 @@ class CFG:
     WARMUP_EPOCHS_HEAD = 2
 
     # Training - Stage 2 (full fine-tune)
+    # 0にするとStage2をスキップ（Kaggle 9時間制限対策）
     BATCH_SIZE_FINETUNE  = 64    # 音声→Perch→headの全体、メモリ多いので適度に
-    EPOCHS_FINETUNE      = 10
+    EPOCHS_FINETUNE      = 0
     LR_FINETUNE          = 5e-5
     WARMUP_EPOCHS_FT     = 1
     GRAD_CLIP_NORM       = 1.0   # 勾配クリッピング
