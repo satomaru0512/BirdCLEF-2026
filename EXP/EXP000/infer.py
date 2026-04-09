@@ -8,7 +8,6 @@ EXP000: BirdCLEF+ 2026 推論スクリプト
              非鳥類72種（昆虫・両生類・哺乳類・爬虫類）は確率0を出力
 """
 
-import glob
 import librosa
 from pathlib import Path
 
@@ -40,8 +39,9 @@ class CFG:
     # Classes
     N_CLASSES = 234
 
-    # バッチ処理: 何ファイルずつPerchに渡すか（16ファイル×12セグメント=192セグメント/バッチ）
-    BATCH_FILES = 16
+    # バッチ処理: 何ファイルずつPerchに渡すか（8ファイル×12セグメント=96セグメント/バッチ）
+    # 16→8に削減: 16ファイル時は入力テンソル約120MB、CPU環境でのOOMリスク低減のため
+    BATCH_FILES = 8
 
     # Perch
     PERCH_HANDLE = (
@@ -57,9 +57,10 @@ def load_label_cols() -> list:
     """sample_submission.csv の列順を正として label_cols を返す"""
     sample_sub = pd.read_csv(CFG.DATA_DIR / "sample_submission.csv", nrows=1)
     label_cols = [c for c in sample_sub.columns if c != "row_id"]
-    assert len(label_cols) == CFG.N_CLASSES, (
-        f"sample_submission has {len(label_cols)} label cols, expected {CFG.N_CLASSES}"
-    )
+    if len(label_cols) != CFG.N_CLASSES:
+        raise ValueError(
+            f"sample_submission has {len(label_cols)} label cols, expected {CFG.N_CLASSES}"
+        )
     return label_cols
 
 
@@ -137,9 +138,9 @@ def split_into_segments(audio: np.ndarray) -> list:
 
 
 def parse_filename_to_row_ids(filepath: str) -> list:
-    """ファイル名から row_id リスト（end_time=5,10,...,60）を生成"""
+    """ファイル名から row_id リスト（end_time=DURATION, 2*DURATION, ..., N_SEGMENTS*DURATION）を生成"""
     stem = Path(filepath).stem
-    return [f"{stem}_{t}" for t in range(5, 65, 5)]
+    return [f"{stem}_{(i + 1) * CFG.DURATION}" for i in range(CFG.N_SEGMENTS)]
 
 
 # ============================================================
@@ -151,29 +152,32 @@ def predict_batch(
     mapping: np.ndarray,
 ) -> np.ndarray:
     """
-    複数セグメントをまとめてPerchに渡して推論する（バッチ処理）。
-    EXP000からの変更: 1セグメントずつ→まとめて処理（7200回→38回のPerch呼び出しに削減）
+    複数ファイル分のセグメントをまとめて受け取り推論する。
+    Perch v2のserving_defaultは(1, 160000)固定のため、内部では1セグメントずつ処理。
+    ファイルI/Oをバッチ化することでオーバーヘッドを削減。
 
     Args:
         segments: 任意個数のセグメントリスト（各要素: shape (N_SAMPLES,)）
     Returns:
         preds: shape (len(segments), N_CLASSES)
     """
-    x         = np.stack(segments).astype(np.float32)  # (N, 160000)
-    x_tf      = tf.constant(x, dtype=tf.float32)
-    outputs   = infer_fn(inputs=x_tf)
-    logits    = outputs["output_0"].numpy()             # (N, N_perch_classes)
-    probs     = 1.0 / (1.0 + np.exp(-logits))          # sigmoid
-
+    # Perch v2のserving_defaultは(1, 160000)のみ受け付けるため1セグメントずつ処理
     preds     = np.zeros((len(segments), CFG.N_CLASSES), dtype=np.float32)
     bird_mask = mapping >= 0
-    preds[:, bird_mask] = probs[:, mapping[bird_mask]]  # 非鳥類は0.0のまま
+
+    for i, seg in enumerate(segments):
+        audio_tf = tf.constant(seg[np.newaxis, :], dtype=tf.float32)  # (1, 160000)
+        outputs  = infer_fn(inputs=audio_tf)
+        logits   = outputs["output_0"].numpy()[0]
+        probs    = 1.0 / (1.0 + np.exp(-logits))
+        preds[i, bird_mask] = probs[mapping[bird_mask]]
+
     return preds
 
 
 def run_inference(perch_path: str, label_cols: list) -> pd.DataFrame:
     """Perch直接推論 → submission DataFrame"""
-    test_files = sorted(glob.glob(str(CFG.TEST_SOUNDSCAPE_DIR / "*.ogg")))
+    test_files = sorted(CFG.TEST_SOUNDSCAPE_DIR.glob("*.ogg"))
     print(f"Test files: {len(test_files)}")
 
     if len(test_files) == 0:
@@ -201,22 +205,16 @@ def run_inference(perch_path: str, label_cols: list) -> pd.DataFrame:
         # バッチ内の全ファイルのセグメントを結合
         batch_segments = []
         batch_row_ids  = []
-        files_n_segs   = []  # ファイルごとのセグメント数（常に12）
         for filepath in batch_paths:
             audio    = load_audio_full(filepath)
             segments = split_into_segments(audio)
             batch_segments.extend(segments)
             batch_row_ids.extend(parse_filename_to_row_ids(filepath))
-            files_n_segs.append(len(segments))
 
-        # まとめて1回のPerch呼び出し（例: 16ファイル×12セグ=192セグメント）
-        batch_preds = predict_batch(infer_fn, batch_segments, mapping)  # (192, 234)
+        # バッチ内の全セグメントを推論（Perch内部は1セグメントずつ処理）
+        batch_preds = predict_batch(infer_fn, batch_segments, mapping)
 
-        # ファイル単位に戻して格納
-        seg_cursor = 0
-        for n_segs in files_n_segs:
-            preds_list.append(batch_preds[seg_cursor:seg_cursor + n_segs])
-            seg_cursor += n_segs
+        preds_list.append(batch_preds)
         row_id_list.extend(batch_row_ids)
 
     preds_array = np.vstack(preds_list)  # (N_files*12, 234)
