@@ -40,6 +40,9 @@ class CFG:
     # Classes
     N_CLASSES = 234
 
+    # バッチ処理: 何ファイルずつPerchに渡すか（16ファイル×12セグメント=192セグメント/バッチ）
+    BATCH_FILES = 16
+
     # Perch
     PERCH_HANDLE = (
         "google/bird-vocalization-classifier"
@@ -142,29 +145,30 @@ def parse_filename_to_row_ids(filepath: str) -> list:
 # ============================================================
 # 推論
 # ============================================================
-def predict_segments(
+def predict_batch(
     infer_fn,
     segments: list,
     mapping: np.ndarray,
 ) -> np.ndarray:
     """
-    12セグメントを推論してコンペ234種の確率を返す。
-    Returns: shape (12, N_CLASSES)
+    複数セグメントをまとめてPerchに渡して推論する（バッチ処理）。
+    EXP000からの変更: 1セグメントずつ→まとめて処理（7200回→38回のPerch呼び出しに削減）
+
+    Args:
+        segments: 任意個数のセグメントリスト（各要素: shape (N_SAMPLES,)）
+    Returns:
+        preds: shape (len(segments), N_CLASSES)
     """
-    all_preds = np.zeros((len(segments), CFG.N_CLASSES), dtype=np.float32)
+    x         = np.stack(segments).astype(np.float32)  # (N, 160000)
+    x_tf      = tf.constant(x, dtype=tf.float32)
+    outputs   = infer_fn(inputs=x_tf)
+    logits    = outputs["output_0"].numpy()             # (N, N_perch_classes)
+    probs     = 1.0 / (1.0 + np.exp(-logits))          # sigmoid
+
+    preds     = np.zeros((len(segments), CFG.N_CLASSES), dtype=np.float32)
     bird_mask = mapping >= 0
-
-    for i, seg in enumerate(segments):
-        audio_tf = tf.constant(seg[np.newaxis, :], dtype=tf.float32)  # (1, 160000)
-        outputs  = infer_fn(inputs=audio_tf)
-        logits   = outputs["output_0"].numpy()[0]  # (N_perch_classes,)
-        probs    = 1.0 / (1.0 + np.exp(-logits))  # sigmoid
-
-        # コンペ種にマッピング（鳥類のみ）
-        all_preds[i, bird_mask] = probs[mapping[bird_mask]]
-        # 非鳥類（mapping == -1）は 0.0 のまま
-
-    return all_preds  # (12, N_CLASSES)
+    preds[:, bird_mask] = probs[:, mapping[bird_mask]]  # 非鳥類は0.0のまま
+    return preds
 
 
 def run_inference(perch_path: str, label_cols: list) -> pd.DataFrame:
@@ -186,21 +190,38 @@ def run_inference(perch_path: str, label_cols: list) -> pd.DataFrame:
     infer_fn    = perch_model.signatures["serving_default"]
     print("Perch loaded.")
 
-    # 推論
-    all_rows = []
-    for filepath in tqdm(test_files, desc="Inference"):
-        audio    = load_audio_full(filepath)
-        segments = split_into_segments(audio)
-        preds    = predict_segments(infer_fn, segments, mapping)  # (12, 234)
-        row_ids  = parse_filename_to_row_ids(filepath)
+    # 推論（バッチ処理: BATCH_FILES ファイルずつまとめてPerchに渡す）
+    row_id_list = []
+    preds_list  = []
+    n_files     = len(test_files)
 
-        for seg_idx, row_id in enumerate(row_ids):
-            row = {"row_id": row_id}
-            for j, label in enumerate(label_cols):
-                row[label] = float(preds[seg_idx, j])
-            all_rows.append(row)
+    for batch_start in tqdm(range(0, n_files, CFG.BATCH_FILES), desc="Inference"):
+        batch_paths = test_files[batch_start:batch_start + CFG.BATCH_FILES]
 
-    submission = pd.DataFrame(all_rows)
+        # バッチ内の全ファイルのセグメントを結合
+        batch_segments = []
+        batch_row_ids  = []
+        files_n_segs   = []  # ファイルごとのセグメント数（常に12）
+        for filepath in batch_paths:
+            audio    = load_audio_full(filepath)
+            segments = split_into_segments(audio)
+            batch_segments.extend(segments)
+            batch_row_ids.extend(parse_filename_to_row_ids(filepath))
+            files_n_segs.append(len(segments))
+
+        # まとめて1回のPerch呼び出し（例: 16ファイル×12セグ=192セグメント）
+        batch_preds = predict_batch(infer_fn, batch_segments, mapping)  # (192, 234)
+
+        # ファイル単位に戻して格納
+        seg_cursor = 0
+        for n_segs in files_n_segs:
+            preds_list.append(batch_preds[seg_cursor:seg_cursor + n_segs])
+            seg_cursor += n_segs
+        row_id_list.extend(batch_row_ids)
+
+    preds_array = np.vstack(preds_list)  # (N_files*12, 234)
+    submission  = pd.DataFrame(preds_array, columns=label_cols)
+    submission.insert(0, "row_id", row_id_list)
     return submission[["row_id"] + label_cols]
 
 
