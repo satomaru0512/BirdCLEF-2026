@@ -59,9 +59,9 @@ class CFG:
 class PerchClassifier(tf.keras.Model):
     """Perch 2.0 backbone + 分類ヘッド"""
 
-    def __init__(self, perch_path: str, n_classes: int):
+    def __init__(self, perch_model, n_classes: int):
         super().__init__()
-        self.perch = tf.saved_model.load(perch_path)
+        self.perch = perch_model  # 外部でロード済みのPerchを受け取る
         self.head = tf.keras.Sequential([
             tf.keras.layers.Dense(512, activation="relu", dtype="float32"),
             tf.keras.layers.Dropout(0.5),
@@ -163,14 +163,18 @@ def run_inference(perch_path: str, weights_dir: Path, label_cols: list) -> pd.Da
         print("No test files found. Creating empty submission for commit.")
         return pd.DataFrame(columns=["row_id"] + label_cols)
 
+    # Perchを1回だけロード（全foldで共有）
+    print("\nLoading Perch backbone (shared across folds)...")
+    shared_perch = tf.saved_model.load(perch_path)
+
     # fold毎に累積して最後に平均
     fold_preds = {fp: np.zeros((12, CFG.N_CLASSES), dtype=np.float32) for fp in test_files}
 
     for fold in range(CFG.N_FOLDS):
         weights_path = weights_dir / f"best_model_fold{fold}.weights.h5"
-        print(f"\n[Fold {fold}] Loading: {weights_path}")
+        print(f"\n[Fold {fold}] Loading weights: {weights_path}")
 
-        model = PerchClassifier(perch_path=perch_path, n_classes=CFG.N_CLASSES)
+        model = PerchClassifier(perch_model=shared_perch, n_classes=CFG.N_CLASSES)
         _ = model(tf.zeros((1, CFG.N_SAMPLES), dtype=tf.float32), training=False)
         model.load_weights(str(weights_path))
         model.trainable = False
