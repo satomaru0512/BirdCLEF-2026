@@ -44,7 +44,7 @@ class CFG:
 
     # Kaggle Models からロードするモデル
     KAGGLE_MODEL_HANDLE = "wasabi777/birdclef2026-exp000/tensorFlow2/perch-v2-baseline"
-    N_FOLDS = 5
+    N_FOLDS = 1  # スコア確認用（本番は5）
 
     # Perch
     PERCH_HANDLE = (
