@@ -6,9 +6,15 @@ EXP000: BirdCLEF+ 2026 推論スクリプト
 - 出力     : submission.csv（5秒セグメントごとの234種確率）
 - 戦略     : Perchのoutput_0（鳥類ロジット）をsigmoidしてeBirdコードでマッピング
              非鳥類72種（昆虫・両生類・哺乳類・爬虫類）は確率0を出力
+
+速度最適化:
+- Perchへの入力を (BATCH_FILES*12, 160000) で一括推論（バッチ非対応時は逐次にフォールバック）
+- 推論前にウォームアップ呼び出しでTFグラフをJITコンパイル
+- ThreadPoolExecutorで音声I/Oを並列化
 """
 
 import librosa
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -38,9 +44,12 @@ class CFG:
     # Classes
     N_CLASSES = 234
 
-    # バッチ処理: 何ファイルずつPerchに渡すか（8ファイル×12セグメント=96セグメント/バッチ）
-    # 16→8に削減: 16ファイル時は入力テンソル約120MB、CPU環境でのOOMリスク低減のため
-    BATCH_FILES = 8
+    # バッチ処理: 何ファイルずつPerchに渡すか
+    # 16ファイル × 12セグメント = 192セグメントを一括推論
+    BATCH_FILES = 16
+
+    # 音声I/O並列スレッド数
+    NUM_WORKERS = 4
 
     # Perch: Kaggle提出環境ではインターネット不可のため固定パスで参照
     # ノートブック設定でデータセットとしてアタッチしておくこと
@@ -71,7 +80,6 @@ def build_mapping(perch_path: str, label_cols: list) -> np.ndarray:
                  mapping[i] = j  → コンペ種iはPerch出力jに対応
                  mapping[i] = -1 → Perchに対応なし（確率0を出力）
     """
-    # Perch のラベルファイルを読み込む（assetsディレクトリ内のlabel.csv）
     label_file = Path(perch_path) / "assets" / "label.csv"
     if not label_file.exists():
         candidates = list(Path(perch_path).rglob("label.csv"))
@@ -88,17 +96,15 @@ def build_mapping(perch_path: str, label_cols: list) -> np.ndarray:
     perch_label_to_idx = {label: idx for idx, label in enumerate(perch_labels)}
     print(f"Perch species count: {len(perch_labels)}")
 
-    # コンペの taxonomy を読み込み（eBirdコード取得のため）
     taxonomy = pd.read_csv(CFG.DATA_DIR / "taxonomy.csv")
     label_to_class = dict(zip(taxonomy["primary_label"], taxonomy["class_name"]))
 
-    # マッピング構築
     mapping = np.full(CFG.N_CLASSES, -1, dtype=np.int32)
     matched = 0
     for comp_idx, label in enumerate(label_cols):
         class_name = label_to_class.get(label, "Unknown")
         if class_name != "Aves":
-            continue  # 非鳥類はスキップ（-1のまま）
+            continue
         perch_idx = perch_label_to_idx.get(label, -1)
         if perch_idx >= 0:
             mapping[comp_idx] = perch_idx
@@ -111,63 +117,68 @@ def build_mapping(perch_path: str, label_cols: list) -> np.ndarray:
     return mapping
 
 
-def load_audio_full(filepath: str) -> np.ndarray:
-    """音声ファイルを全て読み込む（1分）"""
+def load_and_split(filepath) -> tuple:
+    """1ファイルを読み込み、(12セグメントのリスト, row_idのリスト) を返す"""
     try:
         audio, sr = sf.read(filepath)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         if sr != CFG.SAMPLE_RATE:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=CFG.SAMPLE_RATE)
-        return audio.astype(np.float32)
+        audio = audio.astype(np.float32)
     except (OSError, RuntimeError, ValueError) as e:
         print(f"[WARN] Failed to load {filepath}: {e}")
-        return np.zeros(CFG.SAMPLE_RATE * 60, dtype=np.float32)
+        audio = np.zeros(CFG.SAMPLE_RATE * 60, dtype=np.float32)
 
-
-def split_into_segments(audio: np.ndarray) -> list:
-    """音声を 12×N_SAMPLES にpadしてから分割。常に12セグメントを返す。"""
     target = CFG.N_SEGMENTS * CFG.N_SAMPLES
     if len(audio) < target:
         audio = np.pad(audio, (0, target - len(audio)))
     audio = audio[:target]
-    return [audio[i * CFG.N_SAMPLES:(i + 1) * CFG.N_SAMPLES] for i in range(CFG.N_SEGMENTS)]
 
-
-def parse_filename_to_row_ids(filepath: str) -> list:
-    """ファイル名から row_id リスト（end_time=DURATION, 2*DURATION, ..., N_SEGMENTS*DURATION）を生成"""
+    segments = [audio[i * CFG.N_SAMPLES:(i + 1) * CFG.N_SAMPLES] for i in range(CFG.N_SEGMENTS)]
     stem = Path(filepath).stem
-    return [f"{stem}_{(i + 1) * CFG.DURATION}" for i in range(CFG.N_SEGMENTS)]
+    row_ids = [f"{stem}_{(i + 1) * CFG.DURATION}" for i in range(CFG.N_SEGMENTS)]
+    return segments, row_ids
 
 
 # ============================================================
 # 推論
 # ============================================================
-def predict_batch(
-    infer_fn,
-    segments: list,
-    mapping: np.ndarray,
-) -> np.ndarray:
+def warmup(infer_fn):
+    """tf.vectorized_map のグラフコンパイルを事前に実行してレイテンシを削減"""
+    dummy = tf.zeros((2, CFG.N_SAMPLES), dtype=tf.float32)
+    tf.vectorized_map(
+        lambda seg: infer_fn(inputs=tf.expand_dims(seg, 0))["output_0"][0],
+        dummy,
+    )
+    print("Warm-up done.")
+
+
+def predict_batch(infer_fn, segments: list, mapping: np.ndarray) -> np.ndarray:
     """
-    複数ファイル分のセグメントをまとめて受け取り推論する。
-    Perch v2のserving_defaultは(1, 160000)固定のため、内部では1セグメントずつ処理。
-    ファイルI/Oをバッチ化することでオーバーヘッドを削減。
+    tf.vectorized_map で疑似バッチ化して一括推論。
+    Perch v2のserving_defaultは (1, 160000) 固定だが、
+    tf.vectorized_map が「(1, 160000) 用の関数をN個並列実行」してくれる。
 
     Args:
-        segments: 任意個数のセグメントリスト（各要素: shape (N_SAMPLES,)）
+        segments: セグメントのリスト（各要素: shape (N_SAMPLES,)）
     Returns:
         preds: shape (len(segments), N_CLASSES)
     """
-    # Perch v2のserving_defaultは(1, 160000)のみ受け付けるため1セグメントずつ処理
-    preds     = np.zeros((len(segments), CFG.N_CLASSES), dtype=np.float32)
+    n = len(segments)
     bird_mask = mapping >= 0
+    preds = np.zeros((n, CFG.N_CLASSES), dtype=np.float32)
 
-    for i, seg in enumerate(segments):
-        audio_tf = tf.constant(seg[np.newaxis, :], dtype=tf.float32)  # (1, 160000)
-        outputs  = infer_fn(inputs=audio_tf)
-        logits   = outputs["output_0"].numpy()[0]
-        probs    = 1.0 / (1.0 + np.exp(-logits))
-        preds[i, bird_mask] = probs[mapping[bird_mask]]
+    x = tf.constant(np.stack(segments, axis=0), dtype=tf.float32)  # (N, 160000)
+
+    # (1, 160000) 用のシグネチャをN個まとめて並列実行
+    outputs = tf.vectorized_map(
+        lambda seg: infer_fn(inputs=tf.expand_dims(seg, 0))["output_0"][0],
+        x,
+    )  # outputs: (N, n_perch_classes)
+
+    probs = 1.0 / (1.0 + np.exp(-outputs.numpy()))  # (N, n_perch_classes)
+    preds[:, bird_mask] = probs[:, mapping[bird_mask]]
 
     return preds
 
@@ -181,38 +192,37 @@ def run_inference(perch_path: str, label_cols: list) -> pd.DataFrame:
         print("No test files found. Creating empty submission for commit.")
         return pd.DataFrame(columns=["row_id"] + label_cols)
 
-    # マッピング構築
     print("\nBuilding species mapping...")
     mapping = build_mapping(perch_path, label_cols)
 
-    # Perch ロード
     print("\nLoading Perch 2.0...")
     perch_model = tf.saved_model.load(perch_path)
     infer_fn    = perch_model.signatures["serving_default"]
     print("Perch loaded.")
 
-    # 推論（バッチ処理: BATCH_FILES ファイルずつまとめてPerchに渡す）
+    print("Warming up...")
+    warmup(infer_fn)
+
     row_id_list = []
     preds_list  = []
     n_files     = len(test_files)
 
-    for batch_start in tqdm(range(0, n_files, CFG.BATCH_FILES), desc="Inference"):
-        batch_paths = test_files[batch_start:batch_start + CFG.BATCH_FILES]
+    with ThreadPoolExecutor(max_workers=CFG.NUM_WORKERS) as executor:
+        for batch_start in tqdm(range(0, n_files, CFG.BATCH_FILES), desc="Inference"):
+            batch_paths = test_files[batch_start:batch_start + CFG.BATCH_FILES]
 
-        # バッチ内の全ファイルのセグメントを結合
-        batch_segments = []
-        batch_row_ids  = []
-        for filepath in batch_paths:
-            audio    = load_audio_full(filepath)
-            segments = split_into_segments(audio)
-            batch_segments.extend(segments)
-            batch_row_ids.extend(parse_filename_to_row_ids(filepath))
+            # 音声ロードをスレッド並列化
+            results = list(executor.map(load_and_split, batch_paths))
 
-        # バッチ内の全セグメントを推論（Perch内部は1セグメントずつ処理）
-        batch_preds = predict_batch(infer_fn, batch_segments, mapping)
+            batch_segments = []
+            batch_row_ids  = []
+            for segments, row_ids in results:
+                batch_segments.extend(segments)
+                batch_row_ids.extend(row_ids)
 
-        preds_list.append(batch_preds)
-        row_id_list.extend(batch_row_ids)
+            batch_preds = predict_batch(infer_fn, batch_segments, mapping)
+            preds_list.append(batch_preds)
+            row_id_list.extend(batch_row_ids)
 
     preds_array = np.vstack(preds_list)  # (N_files*12, 234)
     submission  = pd.DataFrame(preds_array, columns=label_cols)
