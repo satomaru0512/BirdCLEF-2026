@@ -49,7 +49,9 @@ class CFG:
     MODEL_DIR = Path("/kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/perch_v2_cpu/1")
 
     # バッチ処理: 何ファイルずつPerchに渡すか（batch_n * 12セグメントを一括推論）
-    BATCH_FILES = 16
+    BATCH_FILES    = 16
+    # test_soundscapesが空の場合のドライランファイル数（notebook準拠）
+    DRYRUN_N_FILES = 20
 
     # 温度スケーリング（notebook準拠）
     T_AVES    = 1.10   # 鳥類
@@ -173,8 +175,10 @@ def run_inference(infer_fn, primary_labels: list) -> pd.DataFrame:
     print(f"Test files: {len(test_files)}")
 
     if len(test_files) == 0:
-        print("No test files found. Creating empty submission for commit.")
-        return pd.DataFrame(columns=["row_id"] + primary_labels)
+        # コミット用ドライラン: test_soundscapesが空の場合はtrain_soundscapesで代替
+        fallback_dir = CFG.BASE / "train_soundscapes"
+        test_files   = sorted(fallback_dir.glob("*.ogg"))[:CFG.DRYRUN_N_FILES]
+        print(f"No test files found. Dry-run on {len(test_files)} train soundscapes.")
 
     mapped_pos, mapped_bc_indices = build_mapping(primary_labels)
     class_temps = build_class_temperatures(primary_labels)
