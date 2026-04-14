@@ -11,7 +11,6 @@ EXP000: BirdCLEF+ 2026 推論スクリプト
 import librosa
 from pathlib import Path
 
-import kagglehub
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -43,11 +42,9 @@ class CFG:
     # 16→8に削減: 16ファイル時は入力テンソル約120MB、CPU環境でのOOMリスク低減のため
     BATCH_FILES = 8
 
-    # Perch
-    PERCH_HANDLE = (
-        "google/bird-vocalization-classifier"
-        "/tensorFlow2/bird-vocalization-classifier/2"
-    )
+    # Perch: Kaggle提出環境ではインターネット不可のため固定パスで参照
+    # ノートブック設定でデータセットとしてアタッチしておくこと
+    PERCH_PATH = "/kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/bird-vocalization-classifier/2"
 
 
 # ============================================================
@@ -238,8 +235,7 @@ def main():
     label_cols = load_label_cols()
     print(f"Classes: {len(label_cols)}")
 
-    print("\nDownloading Perch 2.0...")
-    perch_path = kagglehub.model_download(CFG.PERCH_HANDLE)
+    perch_path = CFG.PERCH_PATH
     print(f"Perch path: {perch_path}")
 
     submission = run_inference(perch_path, label_cols)
