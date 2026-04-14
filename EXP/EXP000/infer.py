@@ -1,20 +1,20 @@
 """
-EXP000: BirdCLEF+ 2026 推論スクリプト
-- Backbone : Google Perch 2.0（ファインチューニングなし）
-- 推論環境  : CPU only（Kaggle制約）
-- 入力     : test_soundscapes/ （1分 ogg × ~600ファイル）
-- 出力     : submission.csv（5秒セグメントごとの234種確率）
-- 戦略     : Perchのoutput_0（鳥類ロジット）をsigmoidしてeBirdコードでマッピング
-             非鳥類72種（昆虫・両生類・哺乳類・爬虫類）は確率0を出力
+EXP000: BirdCLEF+ 2026 推論スクリプト（Perch ベースライン）
+- Backbone  : Google Perch 2.0 (perch_v2_cpu)
+- 推論環境   : CPU only（Kaggle制約）
+- 入力      : test_soundscapes/ （1分 ogg × ~600ファイル）
+- 出力      : submission.csv（5秒セグメントごとの234種確率）
+- 設計参照   : bird26-reproduce-perch-protossm-resssm-inf-train.ipynb
 
-速度最適化:
-- Perchへの入力を (BATCH_FILES*12, 160000) で一括推論（バッチ非対応時は逐次にフォールバック）
-- 推論前にウォームアップ呼び出しでTFグラフをJITコンパイル
-- ThreadPoolExecutorで音声I/Oを並列化
+パイプライン:
+  音声読み込み (60s → 12 × 5s)
+  → Perch (batch_n*12, 160000) → logits["label"]
+  → PRIMARY_LABELS へのマッピング
+  → 温度スケーリング → sigmoid
+  → submission.csv
 """
 
-import librosa
-from concurrent.futures import ThreadPoolExecutor
+import re
 from pathlib import Path
 
 import numpy as np
@@ -32,202 +32,185 @@ class CFG:
     CHILD_EXP = "child-exp000"
 
     # Audio
-    SAMPLE_RATE = 32000
-    DURATION    = 5
-    N_SAMPLES   = SAMPLE_RATE * DURATION  # 160_000
-    N_SEGMENTS  = 12                      # 1分 / 5秒 = 12セグメント
+    SR             = 32000
+    WINDOW_SEC     = 5
+    WINDOW_SAMPLES = SR * WINDOW_SEC   # 160_000
+    FILE_SAMPLES   = 60 * SR           # 1_920_000
+    N_WINDOWS      = 12                # 60s / 5s
 
     # Data paths (Kaggle環境)
-    DATA_DIR            = Path("/kaggle/input/competitions/birdclef-2026")
-    TEST_SOUNDSCAPE_DIR = DATA_DIR / "test_soundscapes"
+    BASE               = Path("/kaggle/input/competitions/birdclef-2026")
+    TEST_SOUNDSCAPE_DIR = BASE / "test_soundscapes"
 
     # Classes
     N_CLASSES = 234
 
-    # バッチ処理: 何ファイルずつPerchに渡すか
-    # 16ファイル × 12セグメント = 192セグメントを一括推論
+    # Perch: ノートブック設定でデータセットとしてアタッチしておくこと
+    MODEL_DIR = Path("/kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/perch_v2_cpu/1")
+
+    # バッチ処理: 何ファイルずつPerchに渡すか（batch_n * 12セグメントを一括推論）
     BATCH_FILES = 16
 
-    # 音声I/O並列スレッド数
-    NUM_WORKERS = 4
-
-    # Perch: Kaggle提出環境ではインターネット不可のため固定パスで参照
-    # ノートブック設定でデータセットとしてアタッチしておくこと
-    PERCH_PATH = "/kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/perch_v2_cpu/1"
+    # 温度スケーリング（notebook準拠）
+    T_AVES    = 1.10   # 鳥類
+    T_TEXTURE = 0.95   # 両生類・昆虫
+    TEXTURE_TAXA = {"Amphibia", "Insecta"}
 
 
 # ============================================================
-# Utilities
+# row_id 生成
 # ============================================================
-def load_label_cols() -> list:
-    """sample_submission.csv の列順を正として label_cols を返す"""
-    sample_sub = pd.read_csv(CFG.DATA_DIR / "sample_submission.csv", nrows=1)
-    label_cols = [c for c in sample_sub.columns if c != "row_id"]
-    if len(label_cols) != CFG.N_CLASSES:
-        raise ValueError(
-            f"sample_submission has {len(label_cols)} label cols, expected {CFG.N_CLASSES}"
-        )
-    return label_cols
+def make_row_ids(path: Path) -> list:
+    """stem + _5, _10, ..., _60 のrow_idリストを生成"""
+    stem = path.stem
+    return [f"{stem}_{t}" for t in range(CFG.WINDOW_SEC, 60 + CFG.WINDOW_SEC, CFG.WINDOW_SEC)]
 
 
-def build_mapping(perch_path: str, label_cols: list) -> np.ndarray:
+# ============================================================
+# 音声読み込み
+# ============================================================
+def read_soundscape_60s(path: Path) -> np.ndarray:
+    """60秒音声を (FILE_SAMPLES,) float32 で返す。読み込み失敗時はゼロ埋め。"""
+    try:
+        y, sr = sf.read(path, dtype="float32", always_2d=False)
+        if y.ndim == 2:
+            y = y.mean(axis=1)
+        if sr != CFG.SR:
+            raise ValueError(f"Unexpected sample rate {sr}; expected {CFG.SR}")
+    except Exception as e:
+        print(f"[WARN] {path.name}: {e}")
+        return np.zeros(CFG.FILE_SAMPLES, dtype=np.float32)
+
+    if len(y) < CFG.FILE_SAMPLES:
+        y = np.pad(y, (0, CFG.FILE_SAMPLES - len(y)))
+    else:
+        y = y[:CFG.FILE_SAMPLES]
+    return y
+
+
+# ============================================================
+# Species mapping: PRIMARY_LABELS → Perch bc_index
+# ============================================================
+def build_mapping(primary_labels: list) -> tuple:
     """
-    コンペ種インデックス → Perch出力インデックス のマッピング配列を構築。
-    非鳥類または Perch に存在しない種は -1 を返す。
+    PRIMARY_LABELS と Perch 出力インデックスのマッピングを構築。
 
     Returns:
-        mapping: shape (N_CLASSES,), dtype=int
-                 mapping[i] = j  → コンペ種iはPerch出力jに対応
-                 mapping[i] = -1 → Perchに対応なし（確率0を出力）
+        mapped_pos        : コンペ側インデックス配列
+        mapped_bc_indices : 対応する Perch 側インデックス配列
     """
-    label_file = Path(perch_path) / "assets" / "label.csv"
-    if not label_file.exists():
-        candidates = list(Path(perch_path).rglob("label.csv"))
+    taxonomy = pd.read_csv(CFG.BASE / "taxonomy.csv")
+
+    # Perch ラベルファイルを探す（labels.csv または label.csv）
+    labels_file = CFG.MODEL_DIR / "assets" / "labels.csv"
+    if not labels_file.exists():
+        candidates = list(CFG.MODEL_DIR.rglob("label*.csv"))
         if not candidates:
-            raise FileNotFoundError(
-                f"Perch label.csv not found under {perch_path}. "
-                "Assets directory structure may differ."
-            )
-        label_file = candidates[0]
+            raise FileNotFoundError(f"Perch labels file not found under {CFG.MODEL_DIR}")
+        labels_file = candidates[0]
+    print(f"Perch labels file: {labels_file}")
 
-    print(f"Perch label file: {label_file}")
-    perch_labels_df = pd.read_csv(label_file, header=None, names=["ebird_code"])
-    perch_labels = perch_labels_df["ebird_code"].tolist()
-    perch_label_to_idx = {label: idx for idx, label in enumerate(perch_labels)}
-    print(f"Perch species count: {len(perch_labels)}")
+    bc_labels = pd.read_csv(labels_file)
+    print(f"Perch labels columns: {bc_labels.columns.tolist()}")
+    print(f"Perch species count : {len(bc_labels)}")
 
-    taxonomy = pd.read_csv(CFG.DATA_DIR / "taxonomy.csv")
-    label_to_class = dict(zip(taxonomy["primary_label"], taxonomy["class_name"]))
+    # マッピング構築: scientific_name_lookup が存在する場合はそれで結合、
+    # なければ eBird コード (primary_label) で直接マッチ
+    if "scientific_name_lookup" in bc_labels.columns and "scientific_name_lookup" in taxonomy.columns:
+        merged = taxonomy.merge(
+            bc_labels[["scientific_name_lookup", "bc_index"]].dropna(),
+            on="scientific_name_lookup",
+            how="left",
+        )
+        label_to_bc = dict(zip(merged["primary_label"], merged["bc_index"]))
+    elif "ebird_code" in bc_labels.columns:
+        label_to_bc = dict(zip(bc_labels["ebird_code"], bc_labels.index))
+    else:
+        # 列名を確認してどちらかに対応
+        raise ValueError(
+            f"Cannot build mapping from Perch labels. Columns: {bc_labels.columns.tolist()}"
+        )
 
-    mapping = np.full(CFG.N_CLASSES, -1, dtype=np.int32)
-    matched = 0
-    for comp_idx, label in enumerate(label_cols):
-        class_name = label_to_class.get(label, "Unknown")
-        if class_name != "Aves":
+    class_name_map = taxonomy.set_index("primary_label")["class_name"].to_dict()
+
+    mapped_pos        = []
+    mapped_bc_indices = []
+    for i, lbl in enumerate(primary_labels):
+        # 非鳥類は Perch に対応なし → スキップ（スコア0のまま）
+        if class_name_map.get(lbl, "Aves") not in CFG.TEXTURE_TAXA | {"Aves"}:
             continue
-        perch_idx = perch_label_to_idx.get(label, -1)
-        if perch_idx >= 0:
-            mapping[comp_idx] = perch_idx
-            matched += 1
+        bc_idx = label_to_bc.get(lbl)
+        if bc_idx is not None and not np.isnan(float(bc_idx)):
+            mapped_pos.append(i)
+            mapped_bc_indices.append(int(bc_idx))
 
-    n_birds = sum(1 for lbl in label_cols if label_to_class.get(lbl) == "Aves")
-    print(f"Competition bird species : {n_birds}")
-    print(f"Matched to Perch         : {matched}")
-    print(f"Unmatched (will be 0)    : {n_birds - matched}")
-    return mapping
+    print(f"Mapped species: {len(mapped_pos)} / {len(primary_labels)}")
+    return np.array(mapped_pos, dtype=np.int32), np.array(mapped_bc_indices, dtype=np.int32)
 
 
-def load_and_split(filepath) -> tuple:
-    """1ファイルを読み込み、(12セグメントのリスト, row_idのリスト) を返す"""
-    try:
-        audio, sr = sf.read(filepath)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        if sr != CFG.SAMPLE_RATE:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=CFG.SAMPLE_RATE)
-        audio = audio.astype(np.float32)
-    except (OSError, RuntimeError, ValueError) as e:
-        print(f"[WARN] Failed to load {filepath}: {e}")
-        audio = np.zeros(CFG.SAMPLE_RATE * 60, dtype=np.float32)
+def build_class_temperatures(primary_labels: list) -> np.ndarray:
+    """クラスごとの温度スケーリング配列を構築"""
+    taxonomy       = pd.read_csv(CFG.BASE / "taxonomy.csv")
+    class_name_map = taxonomy.set_index("primary_label")["class_name"].to_dict()
 
-    target = CFG.N_SEGMENTS * CFG.N_SAMPLES
-    if len(audio) < target:
-        audio = np.pad(audio, (0, target - len(audio)))
-    audio = audio[:target]
-
-    segments = [audio[i * CFG.N_SAMPLES:(i + 1) * CFG.N_SAMPLES] for i in range(CFG.N_SEGMENTS)]
-    stem = Path(filepath).stem
-    row_ids = [f"{stem}_{(i + 1) * CFG.DURATION}" for i in range(CFG.N_SEGMENTS)]
-    return segments, row_ids
+    temps = np.full(len(primary_labels), CFG.T_AVES, dtype=np.float32)
+    for i, lbl in enumerate(primary_labels):
+        if class_name_map.get(lbl, "Aves") in CFG.TEXTURE_TAXA:
+            temps[i] = CFG.T_TEXTURE
+    return temps
 
 
 # ============================================================
 # 推論
 # ============================================================
-def warmup(infer_fn):
-    """tf.vectorized_map のグラフコンパイルを事前に実行してレイテンシを削減"""
-    dummy = tf.zeros((2, CFG.N_SAMPLES), dtype=tf.float32)
-    tf.vectorized_map(
-        lambda seg: infer_fn(inputs=tf.expand_dims(seg, 0))["output_0"][0],
-        dummy,
-    )
-    print("Warm-up done.")
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0)))
 
 
-def predict_batch(infer_fn, segments: list, mapping: np.ndarray) -> np.ndarray:
-    """
-    tf.vectorized_map で疑似バッチ化して一括推論。
-    Perch v2のserving_defaultは (1, 160000) 固定だが、
-    tf.vectorized_map が「(1, 160000) 用の関数をN個並列実行」してくれる。
-
-    Args:
-        segments: セグメントのリスト（各要素: shape (N_SAMPLES,)）
-    Returns:
-        preds: shape (len(segments), N_CLASSES)
-    """
-    n = len(segments)
-    bird_mask = mapping >= 0
-    preds = np.zeros((n, CFG.N_CLASSES), dtype=np.float32)
-
-    x = tf.constant(np.stack(segments, axis=0), dtype=tf.float32)  # (N, 160000)
-
-    # (1, 160000) 用のシグネチャをN個まとめて並列実行
-    outputs = tf.vectorized_map(
-        lambda seg: infer_fn(inputs=tf.expand_dims(seg, 0))["output_0"][0],
-        x,
-    )  # outputs: (N, n_perch_classes)
-
-    probs = 1.0 / (1.0 + np.exp(-outputs.numpy()))  # (N, n_perch_classes)
-    preds[:, bird_mask] = probs[:, mapping[bird_mask]]
-
-    return preds
-
-
-def run_inference(perch_path: str, label_cols: list) -> pd.DataFrame:
-    """Perch直接推論 → submission DataFrame"""
+def run_inference(infer_fn, primary_labels: list) -> pd.DataFrame:
+    """Perch推論 → submission DataFrame"""
     test_files = sorted(CFG.TEST_SOUNDSCAPE_DIR.glob("*.ogg"))
     print(f"Test files: {len(test_files)}")
 
     if len(test_files) == 0:
         print("No test files found. Creating empty submission for commit.")
-        return pd.DataFrame(columns=["row_id"] + label_cols)
+        return pd.DataFrame(columns=["row_id"] + primary_labels)
 
-    print("\nBuilding species mapping...")
-    mapping = build_mapping(perch_path, label_cols)
+    mapped_pos, mapped_bc_indices = build_mapping(primary_labels)
+    class_temps = build_class_temperatures(primary_labels)
 
-    print("\nLoading Perch 2.0...")
-    perch_model = tf.saved_model.load(perch_path)
-    infer_fn    = perch_model.signatures["serving_default"]
-    print("Perch loaded.")
+    n_files    = len(test_files)
+    n_rows     = n_files * CFG.N_WINDOWS
+    all_scores = np.zeros((n_rows, len(primary_labels)), dtype=np.float32)
+    all_row_ids = []
+    row_ptr    = 0
 
-    print("Warming up...")
-    warmup(infer_fn)
+    for batch_start in tqdm(range(0, n_files, CFG.BATCH_FILES), desc="Inference"):
+        batch_paths = test_files[batch_start:batch_start + CFG.BATCH_FILES]
+        batch_n     = len(batch_paths)
 
-    row_id_list = []
-    preds_list  = []
-    n_files     = len(test_files)
+        # 音声読み込み → (batch_n * 12, 160000)
+        x = np.empty((batch_n * CFG.N_WINDOWS, CFG.WINDOW_SAMPLES), dtype=np.float32)
+        for i, path in enumerate(batch_paths):
+            y = read_soundscape_60s(path)
+            x[i * CFG.N_WINDOWS:(i + 1) * CFG.N_WINDOWS] = y.reshape(CFG.N_WINDOWS, CFG.WINDOW_SAMPLES)
+            all_row_ids.extend(make_row_ids(path))
 
-    with ThreadPoolExecutor(max_workers=CFG.NUM_WORKERS) as executor:
-        for batch_start in tqdm(range(0, n_files, CFG.BATCH_FILES), desc="Inference"):
-            batch_paths = test_files[batch_start:batch_start + CFG.BATCH_FILES]
+        # Perch 一括推論
+        outputs = infer_fn(inputs=tf.convert_to_tensor(x))
+        logits  = outputs["label"].numpy().astype(np.float32, copy=False)  # (batch_n*12, n_perch_classes)
 
-            # 音声ロードをスレッド並列化
-            results = list(executor.map(load_and_split, batch_paths))
+        # PRIMARY_LABELS へのマッピング
+        n_batch_rows = batch_n * CFG.N_WINDOWS
+        all_scores[row_ptr:row_ptr + n_batch_rows, mapped_pos] = logits[:, mapped_bc_indices]
+        row_ptr += n_batch_rows
 
-            batch_segments = []
-            batch_row_ids  = []
-            for segments, row_ids in results:
-                batch_segments.extend(segments)
-                batch_row_ids.extend(row_ids)
+    # 温度スケーリング → sigmoid
+    probs = sigmoid(all_scores / class_temps[None, :])
 
-            batch_preds = predict_batch(infer_fn, batch_segments, mapping)
-            preds_list.append(batch_preds)
-            row_id_list.extend(batch_row_ids)
-
-    preds_array = np.vstack(preds_list)  # (N_files*12, 234)
-    submission  = pd.DataFrame(preds_array, columns=label_cols)
-    submission.insert(0, "row_id", row_id_list)
-    return submission[["row_id"] + label_cols]
+    submission = pd.DataFrame(probs, columns=primary_labels)
+    submission.insert(0, "row_id", all_row_ids)
+    return submission[["row_id"] + primary_labels]
 
 
 # ============================================================
@@ -235,20 +218,27 @@ def run_inference(perch_path: str, label_cols: list) -> pd.DataFrame:
 # ============================================================
 def main():
     print("=" * 55)
-    print(f"EXP000 Inference: {CFG.CHILD_EXP}")
+    print(f"EXP000 Inference (Perch Baseline): {CFG.CHILD_EXP}")
     print("=" * 55)
 
     # CPUのみ使用（Kaggle推論環境制約）
     tf.config.set_visible_devices([], "GPU")
     print("Using CPU only")
 
-    label_cols = load_label_cols()
-    print(f"Classes: {len(label_cols)}")
+    # PRIMARY_LABELS を sample_submission.csv から取得
+    sample_sub     = pd.read_csv(CFG.BASE / "sample_submission.csv", nrows=1)
+    primary_labels = [c for c in sample_sub.columns if c != "row_id"]
+    assert len(primary_labels) == CFG.N_CLASSES, (
+        f"Expected {CFG.N_CLASSES} classes, got {len(primary_labels)}"
+    )
+    print(f"Classes: {len(primary_labels)}")
 
-    perch_path = CFG.PERCH_PATH
-    print(f"Perch path: {perch_path}")
+    print(f"\nLoading Perch from {CFG.MODEL_DIR} ...")
+    birdclassifier = tf.saved_model.load(str(CFG.MODEL_DIR))
+    infer_fn       = birdclassifier.signatures["serving_default"]
+    print("Perch loaded.")
 
-    submission = run_inference(perch_path, label_cols)
+    submission = run_inference(infer_fn, primary_labels)
 
     output_path = Path("/kaggle/working/submission.csv")
     submission.to_csv(output_path, index=False)
