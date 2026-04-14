@@ -53,7 +53,7 @@ class CFG:
 
     # Perch: Kaggle提出環境ではインターネット不可のため固定パスで参照
     # ノートブック設定でデータセットとしてアタッチしておくこと
-    PERCH_PATH = "/kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/bird-vocalization-classifier/2"
+    PERCH_PATH = "/kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/perch_v2_cpu/1"
 
 
 # ============================================================
